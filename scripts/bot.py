@@ -50,9 +50,9 @@ async def get_secrets():
         secrets = json.loads(response['SecretString'])
         
         return {
-            'username': secrets['ipat_username'],
-            'password': secrets['ipat_password'],
-            'paynavi_pass': secrets['ipat_paynavi_password']
+            'username': secrets['jra_user_id'],
+            'password': secrets['jra_p_ars'],
+            'inet_id': secrets['jra_inet_id']
         }
     except ClientError as e:
         logger.error(f"Failed to retrieve secrets: {e}")
@@ -63,24 +63,10 @@ async def get_secrets():
 
 
 async def get_deposit_amount_from_s3():
-    """S3から入金額設定を取得"""
-    try:
-        s3_client = boto3.client('s3', region_name=os.environ.get('AWS_DEFAULT_REGION', 'ap-northeast-1'))
-        # TODO: S3バケット名とキーを環境変数から取得
-        bucket_name = os.environ.get('S3_CONFIG_BUCKET', 'akatsuki-config')
-        key = os.environ.get('S3_DEPOSIT_CONFIG_KEY', 'deposit_config.json')
-        
-        response = s3_client.get_object(Bucket=bucket_name, Key=key)
-        config = json.loads(response['Body'].read().decode('utf-8'))
-        
-        return config.get('deposit_amount', 10000)
-    except ClientError as e:
-        logger.warning(f"Failed to retrieve deposit config from S3: {e}")
-        logger.info("Using default deposit amount: 10000")
-        return 10000
-    except Exception as e:
-        logger.error(f"Unexpected error retrieving deposit config: {e}")
-        return 10000
+    """S3から入金額設定を取得（現在は仮実装）"""
+    # TODO: S3実装は後回し
+    logger.info("Using default deposit amount: 10000 (S3 integration pending)")
+    return 10000
 
 
 async def login_ipat(page: Page, username: str, password: str):
@@ -92,10 +78,10 @@ async def login_ipat(page: Page, username: str, password: str):
         
         # ログインフォームの入力
         logger.info("Filling login form...")
-        if not await wait_and_fill(page, 'input[name="userNo"]', username):
+        if not await wait_and_fill(page, 'input[name="jra_user_id"]', username):
             raise Exception("Failed to fill username")
         
-        if not await wait_and_fill(page, 'input[name="password"]', password):
+        if not await wait_and_fill(page, 'input[name="jra_p_ars"]', password):
             raise Exception("Failed to fill password")
         
         # ログインボタンクリック
@@ -116,8 +102,8 @@ async def login_ipat(page: Page, username: str, password: str):
         raise
 
 
-async def auto_deposit(page: Page, paynavi_pass: str, amount: int):
-    """PAY-NAVIを使用した自動入金"""
+async def auto_deposit(page: Page, amount: int):
+    """銀行連携による自動入金（既に連携済みの口座から）"""
     try:
         logger.info(f"Starting auto deposit: {amount} yen")
         
@@ -125,14 +111,11 @@ async def auto_deposit(page: Page, paynavi_pass: str, amount: int):
         await page.click('text=入金')
         await page.wait_for_load_state('networkidle')
         
-        # PAY-NAVI選択
-        await page.click('text=PAY-NAVI')
+        # 銀行連携を選択（仮のセレクタ）
+        await page.click('text=銀行から入金')
         
         # 金額入力
         await page.fill('input[name="depositAmount"]', str(amount))
-        
-        # 暗証番号入力
-        await page.fill('input[name="payNaviPassword"]', paynavi_pass)
         
         # 確認画面へ
         await page.click('input[type="submit"][value="確認"]')
@@ -254,7 +237,7 @@ async def main():
             await retry_async(login_ipat, page, secrets['username'], secrets['password'])
             
             # 2) 自動入金（リトライ付き）
-            await retry_async(auto_deposit, page, secrets['paynavi_pass'], deposit_amount)
+            await retry_async(auto_deposit, page, deposit_amount)
             
             # 3) tickets.csv読み込み・投票実行
             tickets_path = Path('tickets/tickets.csv')

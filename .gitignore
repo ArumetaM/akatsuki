@@ -22,8 +22,7 @@ ENV/
 .env.*.local
 
 # Output files
-output/*.csv
-output/*.png
+output/
 
 # Logs
 *.log

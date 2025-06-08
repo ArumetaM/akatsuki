@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 class RetryConfig:
     """リトライ設定"""
-    MAX_RETRIES = 3
+    # 環境に応じてリトライ回数を変更
+    MAX_RETRIES = 3 if os.environ.get('ENV', 'development') == 'production' else 1
     RETRY_DELAY = 5  # seconds
     EXPONENTIAL_BACKOFF = True
 

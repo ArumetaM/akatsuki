@@ -31,18 +31,23 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwrightブラウザをインストール（chromiumのみ）
-RUN playwright install chromium
+# セキュリティのため非rootユーザーを作成
+RUN useradd -m -u 1000 bot
 
 # アプリケーションコードをコピー
 COPY scripts/ ./scripts/
 COPY tickets/ ./tickets/
 
 # 出力ディレクトリを作成
-RUN mkdir -p output
+RUN mkdir -p output logs
 
-# セキュリティのため非rootユーザーで実行
-RUN useradd -m -u 1000 bot && chown -R bot:bot /app
+# 権限を設定
+RUN chown -R bot:bot /app
+
+# ユーザー切り替え
 USER bot
+
+# Playwrightブラウザをインストール（chromiumのみ）
+RUN playwright install chromium
 
 CMD ["python", "scripts/bot.py"]
