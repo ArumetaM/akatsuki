@@ -1,0 +1,6 @@
+playwright==1.44.0
+pandas==2.2.2
+boto3==1.34.69
+python-dotenv==1.0.1
+asyncio==3.4.3
+aiofiles==23.2.1
