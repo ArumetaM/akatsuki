@@ -31,7 +31,7 @@ async def get_secrets():
     """AWS Secrets Managerから認証情報を取得"""
     try:
         client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_DEFAULT_REGION', 'ap-northeast-1'))
-        secret_id = os.environ['SECRETS_MANAGER_SECRET_ID']
+        secret_id = os.environ['AWS_SECRET_NAME']
         
         response = client.get_secret_value(SecretId=secret_id)
         secrets = json.loads(response['SecretString'])
@@ -47,6 +47,27 @@ async def get_secrets():
     except KeyError as e:
         logger.error(f"Missing required secret key: {e}")
         raise
+
+
+async def get_deposit_amount_from_s3():
+    """S3から入金額設定を取得"""
+    try:
+        s3_client = boto3.client('s3', region_name=os.environ.get('AWS_DEFAULT_REGION', 'ap-northeast-1'))
+        # TODO: S3バケット名とキーを環境変数から取得
+        bucket_name = os.environ.get('S3_CONFIG_BUCKET', 'akatsuki-config')
+        key = os.environ.get('S3_DEPOSIT_CONFIG_KEY', 'deposit_config.json')
+        
+        response = s3_client.get_object(Bucket=bucket_name, Key=key)
+        config = json.loads(response['Body'].read().decode('utf-8'))
+        
+        return config.get('deposit_amount', 10000)
+    except ClientError as e:
+        logger.warning(f"Failed to retrieve deposit config from S3: {e}")
+        logger.info("Using default deposit amount: 10000")
+        return 10000
+    except Exception as e:
+        logger.error(f"Unexpected error retrieving deposit config: {e}")
+        return 10000
 
 
 async def login_ipat(page: Page, username: str, password: str):
@@ -188,7 +209,10 @@ async def main():
         # Secrets Managerから認証情報取得
         logger.info("Retrieving credentials from AWS Secrets Manager...")
         secrets = await get_secrets()
-        deposit_amount = int(os.environ.get('AUTO_DEPOSIT_AMOUNT', '10000'))
+        
+        # S3から入金額設定を取得
+        logger.info("Retrieving deposit amount from S3...")
+        deposit_amount = await get_deposit_amount_from_s3()
         
         # Playwrightブラウザ起動
         async with async_playwright() as p:

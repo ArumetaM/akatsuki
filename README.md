@@ -88,8 +88,9 @@ docker run --rm \
 | AWS_ACCESS_KEY_ID | AWSアクセスキー | AKIAXXXXXXXXXXXXXXXX |
 | AWS_SECRET_ACCESS_KEY | AWSシークレットキー | ******** |
 | AWS_DEFAULT_REGION | AWSリージョン | ap-northeast-1 |
-| SECRETS_MANAGER_SECRET_ID | Secrets ManagerのシークレットID | akatsuki/ipat/credentials |
-| AUTO_DEPOSIT_AMOUNT | 自動入金額（円） | 10000 |
+| AWS_SECRET_NAME | Secrets ManagerのシークレットID | keiba_secret |
+| S3_CONFIG_BUCKET | 設定ファイル用S3バケット名 | akatsuki-config |
+| S3_DEPOSIT_CONFIG_KEY | 入金額設定ファイルのS3キー | deposit_config.json |
 | TIMEOUT_MS | ページ遷移待機時間 | 20000 |
 
 ※IPAT認証情報（ログインID、パスワード、PAY-NAVI暗証番号）はAWS Secrets Managerに保存
@@ -134,7 +135,7 @@ import boto3
 async def get_secrets():
     """AWS Secrets Managerから認証情報を取得"""
     client = boto3.client('secretsmanager')
-    secret_id = os.environ['SECRETS_MANAGER_SECRET_ID']
+    secret_id = os.environ['AWS_SECRET_NAME']
     
     response = client.get_secret_value(SecretId=secret_id)
     secrets = json.loads(response['SecretString'])
@@ -148,7 +149,8 @@ async def get_secrets():
 async def main():
     # Secrets Managerから認証情報取得
     secrets = await get_secrets()
-    deposit_amount = int(os.environ.get('AUTO_DEPOSIT_AMOUNT', '10000'))
+    # S3から入金額設定を取得
+    deposit_amount = await get_deposit_amount_from_s3()
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
