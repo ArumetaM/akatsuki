@@ -53,7 +53,7 @@ async def get_secrets():
             'username': secrets['jra_user_id'],
             'password': secrets['jra_p_ars'],
             'inet_id': secrets['jra_inet_id'],
-            'paynavi_pass': secrets.get('ipat_paynavi_password', '')
+            'bank_password': secrets.get('bank_password', '')
         }
     except ClientError as e:
         logger.error(f"Failed to retrieve secrets: {e}")
@@ -103,8 +103,8 @@ async def login_ipat(page: Page, username: str, password: str):
         raise
 
 
-async def auto_deposit(page: Page, paynavi_pass: str, amount: int):
-    """PAY-NAVIを使用した自動入金"""
+async def auto_deposit(page: Page, bank_password: str, amount: int):
+    """銀行連携による自動入金"""
     try:
         logger.info(f"Starting auto deposit: {amount} yen")
         
@@ -112,14 +112,14 @@ async def auto_deposit(page: Page, paynavi_pass: str, amount: int):
         await page.click('text=入金')
         await page.wait_for_load_state('networkidle')
         
-        # PAY-NAVI選択
-        await page.click('text=PAY-NAVI')
+        # 銀行連携を選択（仮のセレクタ）
+        await page.click('text=銀行から入金')
         
         # 金額入力
         await page.fill('input[name="depositAmount"]', str(amount))
         
-        # 暗証番号入力
-        await page.fill('input[name="payNaviPassword"]', paynavi_pass)
+        # 銀行パスワード入力（仮のセレクタ）
+        await page.fill('input[name="bankPassword"]', bank_password)
         
         # 確認画面へ
         await page.click('input[type="submit"][value="確認"]')
@@ -241,7 +241,7 @@ async def main():
             await retry_async(login_ipat, page, secrets['username'], secrets['password'])
             
             # 2) 自動入金（リトライ付き）
-            await retry_async(auto_deposit, page, secrets['paynavi_pass'], deposit_amount)
+            await retry_async(auto_deposit, page, secrets['bank_password'], deposit_amount)
             
             # 3) tickets.csv読み込み・投票実行
             tickets_path = Path('tickets/tickets.csv')

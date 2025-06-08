@@ -93,7 +93,7 @@ docker run --rm \
 | S3_DEPOSIT_CONFIG_KEY | 入金額設定ファイルのS3キー | deposit_config.json |
 | TIMEOUT_MS | ページ遷移待機時間 | 20000 |
 
-※IPAT認証情報（ログインID、パスワード、PAY-NAVI暗証番号）はAWS Secrets Managerに保存
+※IPAT認証情報（ログインID、パスワード、銀行連携用パスワード）はAWS Secrets Managerに保存
 
 ---
 
@@ -144,7 +144,7 @@ async def get_secrets():
         'username': secrets['jra_user_id'],
         'password': secrets['jra_p_ars'],
         'inet_id': secrets['jra_inet_id'],
-        'paynavi_pass': secrets.get('ipat_paynavi_password', '')
+        'bank_password': secrets.get('bank_password', '')
     }
 
 async def main():
@@ -162,7 +162,7 @@ async def main():
         await login_ipat(page, secrets['username'], secrets['password'])
         
         # 2) 自動入金
-        await auto_deposit(page, secrets['paynavi_pass'], deposit_amount)
+        await auto_deposit(page, secrets['bank_password'], deposit_amount)
         
         # 3) tickets.csv読み込み・投票実行
         tickets_df = pd.read_csv('tickets/tickets.csv')
@@ -219,6 +219,6 @@ Apache-2.0
 ### 開発メモ
 
 * IPATのセレクタは実際のサイトを確認しながら調整が必要
-* 入金処理はPAY-NAVI連携で実装
+* 入金処理は銀行口座連携で実装
 * Lambda移行時は`/tmp`へのダウンロード→S3アップロードに変更
 * エラーハンドリング・リトライ処理を別モジュール化予定
