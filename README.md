@@ -93,7 +93,7 @@ docker run --rm \
 | S3_DEPOSIT_CONFIG_KEY | 入金額設定ファイルのS3キー | deposit_config.json |
 | TIMEOUT_MS | ページ遷移待機時間 | 20000 |
 
-※IPAT認証情報（ログインID、パスワード、銀行連携用パスワード）はAWS Secrets Managerに保存
+※IPAT認証情報（ログインID、パスワード、INET ID）はAWS Secrets Managerに保存
 
 ---
 
@@ -143,8 +143,7 @@ async def get_secrets():
     return {
         'username': secrets['jra_user_id'],
         'password': secrets['jra_p_ars'],
-        'inet_id': secrets['jra_inet_id'],
-        'bank_password': secrets.get('bank_password', '')
+        'inet_id': secrets['jra_inet_id']
     }
 
 async def main():
@@ -162,7 +161,7 @@ async def main():
         await login_ipat(page, secrets['username'], secrets['password'])
         
         # 2) 自動入金
-        await auto_deposit(page, secrets['bank_password'], deposit_amount)
+        await auto_deposit(page, deposit_amount)
         
         # 3) tickets.csv読み込み・投票実行
         tickets_df = pd.read_csv('tickets/tickets.csv')

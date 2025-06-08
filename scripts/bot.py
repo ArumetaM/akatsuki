@@ -52,8 +52,7 @@ async def get_secrets():
         return {
             'username': secrets['jra_user_id'],
             'password': secrets['jra_p_ars'],
-            'inet_id': secrets['jra_inet_id'],
-            'bank_password': secrets.get('bank_password', '')
+            'inet_id': secrets['jra_inet_id']
         }
     except ClientError as e:
         logger.error(f"Failed to retrieve secrets: {e}")
@@ -103,8 +102,8 @@ async def login_ipat(page: Page, username: str, password: str):
         raise
 
 
-async def auto_deposit(page: Page, bank_password: str, amount: int):
-    """銀行連携による自動入金"""
+async def auto_deposit(page: Page, amount: int):
+    """銀行連携による自動入金（既に連携済みの口座から）"""
     try:
         logger.info(f"Starting auto deposit: {amount} yen")
         
@@ -117,9 +116,6 @@ async def auto_deposit(page: Page, bank_password: str, amount: int):
         
         # 金額入力
         await page.fill('input[name="depositAmount"]', str(amount))
-        
-        # 銀行パスワード入力（仮のセレクタ）
-        await page.fill('input[name="bankPassword"]', bank_password)
         
         # 確認画面へ
         await page.click('input[type="submit"][value="確認"]')
@@ -241,7 +237,7 @@ async def main():
             await retry_async(login_ipat, page, secrets['username'], secrets['password'])
             
             # 2) 自動入金（リトライ付き）
-            await retry_async(auto_deposit, page, secrets['bank_password'], deposit_amount)
+            await retry_async(auto_deposit, page, deposit_amount)
             
             # 3) tickets.csv読み込み・投票実行
             tickets_path = Path('tickets/tickets.csv')
