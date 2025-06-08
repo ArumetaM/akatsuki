@@ -141,9 +141,10 @@ async def get_secrets():
     secrets = json.loads(response['SecretString'])
     
     return {
-        'username': secrets['ipat_username'],
-        'password': secrets['ipat_password'],
-        'paynavi_pass': secrets['ipat_paynavi_password']
+        'username': secrets['jra_user_id'],
+        'password': secrets['jra_p_ars'],
+        'inet_id': secrets['jra_inet_id'],
+        'paynavi_pass': secrets.get('ipat_paynavi_password', '')
     }
 
 async def main():
