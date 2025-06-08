@@ -11,6 +11,16 @@ import pandas as pd
 import boto3
 from botocore.exceptions import ClientError
 
+# カスタムユーティリティ
+from utils import (
+    retry_async,
+    take_screenshot,
+    wait_and_click,
+    wait_and_fill,
+    safe_navigate,
+    setup_file_logging
+)
+
 # 環境変数読み込み
 load_dotenv()
 
@@ -20,6 +30,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ファイルログも設定
+setup_file_logging('akatsuki_bot')
 
 # 定数
 IPAT_URL = "https://www.ipat.jra.go.jp/"
@@ -74,15 +87,20 @@ async def login_ipat(page: Page, username: str, password: str):
     """IPATにログイン"""
     try:
         logger.info("Navigating to IPAT login page...")
-        await page.goto(IPAT_URL, wait_until='networkidle', timeout=TIMEOUT_MS)
+        if not await safe_navigate(page, IPAT_URL, TIMEOUT_MS):
+            raise Exception("Failed to navigate to IPAT")
         
         # ログインフォームの入力
         logger.info("Filling login form...")
-        await page.fill('input[name="userNo"]', username)
-        await page.fill('input[name="password"]', password)
+        if not await wait_and_fill(page, 'input[name="userNo"]', username):
+            raise Exception("Failed to fill username")
+        
+        if not await wait_and_fill(page, 'input[name="password"]', password):
+            raise Exception("Failed to fill password")
         
         # ログインボタンクリック
-        await page.click('input[type="submit"][value="ログイン"]')
+        if not await wait_and_click(page, 'input[type="submit"][value="ログイン"]'):
+            raise Exception("Failed to click login button")
         
         # ログイン成功を確認
         await page.wait_for_selector('text=マイページ', timeout=TIMEOUT_MS)
@@ -90,9 +108,11 @@ async def login_ipat(page: Page, username: str, password: str):
         
     except TimeoutError:
         logger.error("Login timeout - check credentials or network connection")
+        await take_screenshot(page, "login_timeout")
         raise
     except Exception as e:
         logger.error(f"Login failed: {e}")
+        await take_screenshot(page, "login_error")
         raise
 
 
@@ -136,11 +156,12 @@ async def place_bet(page: Page, ticket: pd.Series):
         logger.info(f"Placing bet: {ticket['race_date']} {ticket['race_name']}")
         
         # 購入ページへ移動
-        await page.click('text=投票')
+        if not await wait_and_click(page, 'text=投票'):
+            raise Exception("Failed to navigate to betting page")
         await page.wait_for_load_state('networkidle')
         
         # レース選択
-        await page.fill('input[name="raceDate"]', ticket['race_date'])
+        await wait_and_fill(page, 'input[name="raceDate"]', ticket['race_date'])
         await page.select_option('select[name="raceCourse"]', ticket['race_course'])
         await page.select_option('select[name="raceNumber"]', str(ticket['race_number']))
         
@@ -150,17 +171,19 @@ async def place_bet(page: Page, ticket: pd.Series):
         # 馬番号入力
         horse_numbers = ticket['horse_numbers'].split(',')
         for i, horse_num in enumerate(horse_numbers):
-            await page.fill(f'input[name="horse{i+1}"]', horse_num.strip())
+            await wait_and_fill(page, f'input[name="horse{i+1}"]', horse_num.strip())
         
         # 金額入力
-        await page.fill('input[name="amount"]', str(ticket['amount']))
+        await wait_and_fill(page, 'input[name="amount"]', str(ticket['amount']))
         
         # 購入確認
-        await page.click('input[type="submit"][value="投票内容確認"]')
+        if not await wait_and_click(page, 'input[type="submit"][value="投票内容確認"]'):
+            raise Exception("Failed to confirm bet")
         await page.wait_for_load_state('networkidle')
         
         # 購入実行
-        await page.click('input[type="submit"][value="投票する"]')
+        if not await wait_and_click(page, 'input[type="submit"][value="投票する"]'):
+            raise Exception("Failed to place bet")
         
         # 完了確認
         await page.wait_for_selector('text=投票が完了しました', timeout=TIMEOUT_MS)
@@ -168,6 +191,7 @@ async def place_bet(page: Page, ticket: pd.Series):
         
     except Exception as e:
         logger.error(f"Failed to place bet: {e}")
+        await take_screenshot(page, f"bet_error_{ticket['race_name'].replace(' ', '_')}")
         raise
 
 
@@ -226,11 +250,11 @@ async def main():
             )
             page = await context.new_page()
             
-            # 1) IPATログイン
-            await login_ipat(page, secrets['username'], secrets['password'])
+            # 1) IPATログイン（リトライ付き）
+            await retry_async(login_ipat, page, secrets['username'], secrets['password'])
             
-            # 2) 自動入金
-            await auto_deposit(page, secrets['paynavi_pass'], deposit_amount)
+            # 2) 自動入金（リトライ付き）
+            await retry_async(auto_deposit, page, secrets['paynavi_pass'], deposit_amount)
             
             # 3) tickets.csv読み込み・投票実行
             tickets_path = Path('tickets/tickets.csv')
@@ -241,11 +265,13 @@ async def main():
                 
                 for idx, ticket in tickets_df.iterrows():
                     try:
-                        await place_bet(page, ticket)
+                        await retry_async(place_bet, page, ticket, max_retries=2)
                         # レート制限対策で少し待機
                         await asyncio.sleep(2)
                     except Exception as e:
                         logger.error(f"Failed to process ticket {idx+1}: {e}")
+                        # エラー時のスクリーンショット
+                        await take_screenshot(page, f"ticket_error_{idx+1}")
                         continue
             else:
                 logger.warning("No tickets.csv found, skipping betting phase")
@@ -258,6 +284,15 @@ async def main():
             
     except Exception as e:
         logger.error(f"Fatal error in main process: {e}")
+        # 最終的なエラースクリーンショット
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=HEADLESS_MODE)
+                page = await browser.new_page()
+                await take_screenshot(page, "fatal_error")
+                await browser.close()
+        except:
+            pass
         raise
 
 
