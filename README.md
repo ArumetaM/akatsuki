@@ -1,199 +1,221 @@
-# Auto‑Bet Horse Racing Bot (MVP)
+# akatsuki - JRA自動投票Bot (MVP)
 
-> Deposit funds → purchase betting tickets → download voting results (CSV)  
-> **Tech**: TypeScript + Playwright / Docker / WSL2 (local dev)  
-> **Scope**: MVP without S3; purchases simulated from a local `tickets.csv`.
-
----
-
-## 1. Why another repo?
-
-* 自宅 PC の GPU を用いた予測モデルで算出した **購入指示 (tickets.csv)** を自動実行  
-* 初期段階はローカルのみで完結させ、  
-  * **ヘッドレスブラウザ操作** が安定する  
-  * **Docker イメージ** が 1 コマンドで再現  
- する状態を作る  
-* 安定後に **S3 → AWS Lambda (定期実行)** へ lift‑&‑shift
+> 入金 → 馬券購入 → 投票結果CSV取得を自動化  
+> **Tech**: Python + Playwright / Docker / WSL2 (local dev)  
+> **Scope**: MVPはS3連携なし、ローカルの`tickets.csv`から投票実行
 
 ---
 
-## 2. Architecture (MVP)
+## 1. プロジェクト概要
 
-┌────────────┐ ┌─────────────┐
-│tickets.csv │──────▶│Docker‑ized │
-│(local) │ │Playwright Bot│
-└────────────┘ └────┬────────┘
-▼
-Betting Website
-▼
-results-yyyyMMdd.csv
-
-* **tickets.csv** … 1 行 1 購入指示  
-  `<race_id>,<horse_no>,<bet_type>,<amount>`  
-* **Playwright Bot** …  
-  1. ログイン  
-  2. 必要額を入金（Stub／手動承認で代替可能）  
-  3. 指示通りに馬券を購入  
-  4. 購入完了後、投票結果 CSV をダウンロード  
-* 取得した CSV は `output/` に保存。後続フェーズで S3 へアップロード予定。
+* 自宅PCのGPU予測モデルで算出した**購入指示 (tickets.csv)** を自動実行
+* 初期段階はローカル完結で開発し、安定動作を確認
+* 将来的に**S3 → AWS Lambda (定期実行)** へ移行予定
+* boto3との親和性を考慮しPythonで実装
 
 ---
 
-## 3. Repository Layout
+## 2. アーキテクチャ (MVP)
 
+```
+┌────────────┐     ┌─────────────────┐
+│tickets.csv │────▶│ Docker Container │
+│  (local)   │     │ Python+Playwright│
+└────────────┘     └────────┬────────┘
+                            │
+                            ▼
+                    https://www.ipat.jra.go.jp/
+                            │
+                            ▼
+                    output/results-yyyyMMdd.csv
+```
+
+* **tickets.csv**: 購入指示ファイル（フォーマット開発中）
+* **Playwright Bot**:
+  1. IPAT.JRA.GO.JPへログイン
+  2. 自動入金処理
+  3. 指示通りに馬券購入
+  4. 投票結果CSVダウンロード
+* 取得したCSVは`output/`に保存（将来S3へアップロード）
+
+---
+
+## 3. ディレクトリ構成
+
+```
 .
 ├── docker/
-│ └── Dockerfile # Node + Playwright + cron (later)
+│   └── Dockerfile          # Python + Playwright環境
 ├── scripts/
-│ └── bot.ts # Entry point
-├── tickets/ # ← 手動配置 (MVP)
-│ └── sample_tickets.csv
-├── output/ # DL した CSV を格納
-├── .env.example # 環境変数テンプレ
+│   └── bot.py             # メインスクリプト
+├── tickets/               # 購入指示CSV配置
+│   └── sample_tickets.csv
+├── output/                # ダウンロードしたCSV保存先
+├── requirements.txt       # Python依存関係
+├── .env.example          # 環境変数テンプレート
 └── README.md
+```
 
 ---
 
-## 4. Quick Start (local WSL + Docker Compose)
+## 4. Quick Start (ローカル開発)
 
 ```bash
-# 1) まず Playwright の依存入りイメージをビルド
-docker build -t auto-bet-bot -f docker/Dockerfile .
+# 1) Dockerイメージのビルド
+docker build -t akatsuki-bot -f docker/Dockerfile .
 
-# 2) 購入指示を配置
+# 2) 購入指示CSVを配置
 cp path/to/your/tickets.csv tickets/
 
-# 3) .env を作る（後述の ENV 参照）
+# 3) 環境変数を設定
 cp .env.example .env
-$EDITOR .env
+vim .env  # IPATのログイン情報を設定
 
-# 4) 実行（ローカルブラウザ UI のデバッグ時は HEADLESS=false）
+# 4) 実行
 docker run --rm \
   --env-file .env \
   -v ${PWD}/tickets:/app/tickets \
   -v ${PWD}/output:/app/output \
-  auto-bet-bot
-ログはコンテナ標準出力に流れます。output/ に結果 CSV が落ちれば成功。
+  akatsuki-bot
+```
 
-5. Environment Variables (.env)
-Key	説明	例
-BET_PORTAL_USERNAME	投票サイトのログイン ID	your_id
-BET_PORTAL_PASSWORD	パスワード	********
-HEADLESS	"true" / "false" でブラウザ表示	true
-DEPOSIT_METHOD	"manual" or "auto"	manual
-TIMEOUT_MS	ページ遷移の最大待機 ms	20000
+---
 
-将来的に AWS Secrets Manager / Parameter Store へ移行予定。
+## 5. 環境変数 (.env)
 
-6. Implementation Guide
-6.1 Dockerfile（抜粋）
-Dockerfile
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+| Key | 説明 | 例 |
+|-----|------|-----|
+| AWS_ACCESS_KEY_ID | AWSアクセスキー | AKIAXXXXXXXXXXXXXXXX |
+| AWS_SECRET_ACCESS_KEY | AWSシークレットキー | ******** |
+| AWS_DEFAULT_REGION | AWSリージョン | ap-northeast-1 |
+| SECRETS_MANAGER_SECRET_ID | Secrets ManagerのシークレットID | akatsuki/ipat/credentials |
+| AUTO_DEPOSIT_AMOUNT | 自動入金額（円） | 10000 |
+| TIMEOUT_MS | ページ遷移待機時間 | 20000 |
+
+※IPAT認証情報（ログインID、パスワード、PAY-NAVI暗証番号）はAWS Secrets Managerに保存
+
+---
+
+## 6. 実装詳細
+
+### 6.1 Dockerfile
+
+```dockerfile
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Playwrightブラウザをインストール
+RUN playwright install chromium
+
 COPY . .
 
-# Run under a non‑root user for safety
-RUN adduser --disabled-password bot && chown -R bot /app
+# セキュリティのため非rootユーザーで実行
+RUN useradd -m -u 1000 bot && chown -R bot:bot /app
 USER bot
 
-CMD ["node", "dist/bot.js"]
-6.2 bot.ts 主なステップ
-ts
-import { chromium } from 'playwright';
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
+CMD ["python", "scripts/bot.py"]
+```
 
-(async () => {
-  const {
-    BET_PORTAL_USERNAME,
-    BET_PORTAL_PASSWORD,
-    HEADLESS = 'true',
-    TIMEOUT_MS = '20000',
-  } = process.env;
+### 6.2 bot.py メインフロー
 
-  const browser = await chromium.launch({ headless: HEADLESS === 'true' });
-  const context  = await browser.newContext({ acceptDownloads: true });
-  const page     = await context.newPage();
+```python
+import os
+import asyncio
+import json
+from datetime import datetime
+from playwright.async_api import async_playwright
+import pandas as pd
+import boto3
 
-  // 1) login
-  await page.goto('https://example-bet.jp/login');
-  await page.fill('#user', BET_PORTAL_USERNAME!);
-  await page.fill('#pass', BET_PORTAL_PASSWORD!);
-  await Promise.all([
-    page.waitForNavigation({ timeout: +TIMEOUT_MS }),
-    page.click('button[type=submit]'),
-  ]);
+async def get_secrets():
+    """AWS Secrets Managerから認証情報を取得"""
+    client = boto3.client('secretsmanager')
+    secret_id = os.environ['SECRETS_MANAGER_SECRET_ID']
+    
+    response = client.get_secret_value(SecretId=secret_id)
+    secrets = json.loads(response['SecretString'])
+    
+    return {
+        'username': secrets['ipat_username'],
+        'password': secrets['ipat_password'],
+        'paynavi_pass': secrets['ipat_paynavi_password']
+    }
 
-  // 2) deposit (stub)
-  //    depositFunds(page);
+async def main():
+    # Secrets Managerから認証情報取得
+    secrets = await get_secrets()
+    deposit_amount = int(os.environ.get('AUTO_DEPOSIT_AMOUNT', '10000'))
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        
+        # 1) IPATログイン
+        await login_ipat(page, secrets['username'], secrets['password'])
+        
+        # 2) 自動入金
+        await auto_deposit(page, secrets['paynavi_pass'], deposit_amount)
+        
+        # 3) tickets.csv読み込み・投票実行
+        tickets_df = pd.read_csv('tickets/tickets.csv')
+        for _, ticket in tickets_df.iterrows():
+            await place_bet(page, ticket)
+        
+        # 4) 投票結果ダウンロード
+        download_path = await download_results(page)
+        print(f"Results saved to: {download_path}")
+        
+        await browser.close()
 
-  // 3) iterate tickets
-  const tickets = await fs.readFile('tickets/tickets.csv', 'utf-8');
-  for (const t of tickets.trim().split('\n')) {
-    // parse & place bets ...
-  }
-
-  // 4) DL results
-  const [ download ] = await Promise.all([
-    page.waitForEvent('download'),
-    page.click('text=CSVダウンロード'),
-  ]);
-  const filePath = path.join('output', await download.suggestedFilename());
-  await download.saveAs(filePath);
-
-  await browser.close();
-})();
-リトライ・エラーハンドリング は別モジュール化予定
-
-unit test → jest + Playwright test runner
-
-7. CI / CD (optional)
-GitHub Actions
-
-docker build → docker push ghcr.io/<user>/auto-bet-bot:sha
-
-将来: sam build で Lambda 用 ZIP を artifact 化
-
-Playwright Test Report を PR コミットに自動添付
-
-8. Roadmap
-フェーズ	ゴール	技術トピック
-MVP	ローカル Docker で自動購入 & CSV 取得	Playwright / dotenv
-Phase 2	S3 連携 (tickets 取得 + results 保管)	AWS SDK v3 / S3 Gateway IAM
-Phase 3	Lambda 化＋EventBridge cron (例: 毎 Raceday 08:55)	Lambda container images / AWS SAM
-Phase 4	セキュリティ & 運用	SSM Parameter Store / CloudWatch Logs / Alarm
-Phase 5	モデル & 資金管理自動フィードバック	DynamoDB / Step Functions / SageMaker
-
-9. Contributing
-devcontainer.json で VS Code Remote Containers に対応
-
-npm run format (prettier) + npm run lint (eslint) が CI Gate
-
-Issue / PR テンプレートに 再現手順 と 期待結果 を記載
-
-10. License
-Apache‑2.0
-© 2025 Your Name
+if __name__ == "__main__":
+    asyncio.run(main())
+```
 
 ---
 
-### 使い方のポイント
+## 7. CI/CD (将来実装)
 
-* **“最初は動く最小構成”** を徹底  
-  - S3 を見据えていても **ローカルファイル** から始める  
-  - 入金 API が無い場合は Stub⇢手動確認に切り替えやすい設計に  
-* Playwright の selector は **公式レース投票サイト** を実際に操作してから `page.getByRole()` 系を優先  
-* コンテナ化によって **WSL2 / macOS / CI** でも同一挙動  
-* Lambda 移行時は  
-  - **`aws lambda build` 時の `--no-cache`** で chromium‑ffmpeg layer サイズ削減  
-  - `context.download` → `/tmp` 保存 → S3 putObject に変更
+* GitHub Actions でDockerイメージビルド・プッシュ
+* Playwright Test Reportの自動生成
+* AWS SAMでLambdaデプロイパイプライン構築
 
 ---
 
-これをベースに **AI 生成コード** を行う場合は、上記ステップごとに「タスクカード」を切り出し、GitHub Copilot Chat / GPT‑4o などへ以下のようにプロンプトすると効率的です。
+## 8. ロードマップ
 
-「docker/Dockerfile を上記 README の仕様で作って」
-「playwright でログイン〜CSV ダウンロードのスクリプトを書いて。入力は tickets/tickets.csv 」
+| フェーズ | ゴール | 技術要素 |
+|---------|--------|----------|
+| **MVP** | ローカルで自動投票・CSV取得 | Python, Playwright, Docker |
+| Phase 2 | S3連携（tickets取得・results保存） | boto3, IAM |
+| Phase 3 | Lambda化 + EventBridge定期実行 | Lambda Container, SAM |
+| Phase 4 | セキュリティ・監視強化 | Secrets Manager, CloudWatch |
+| Phase 5 | 予測モデル連携・資金管理自動化 | DynamoDB, Step Functions |
+
+---
+
+## 9. Contributing
+
+* `.devcontainer/devcontainer.json` でVS Code Remote Containers対応
+* `black` + `flake8` でコード品質管理
+* Issue/PRテンプレートで再現手順・期待結果を明記
+
+---
+
+## 10. License
+
+Apache-2.0  
+© 2025 Yusuke
+
+---
+
+### 開発メモ
+
+* IPATのセレクタは実際のサイトを確認しながら調整が必要
+* 入金処理はPAY-NAVI連携で実装
+* Lambda移行時は`/tmp`へのダウンロード→S3アップロードに変更
+* エラーハンドリング・リトライ処理を別モジュール化予定
