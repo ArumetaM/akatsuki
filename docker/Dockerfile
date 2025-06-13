@@ -50,4 +50,4 @@ USER bot
 # Playwrightブラウザをインストール（chromiumのみ）
 RUN playwright install chromium
 
-CMD ["python", "scripts/bot.py"]
+CMD ["python", "scripts/bot_v2.py"]
