@@ -1242,9 +1242,20 @@ async def login_ipat_v2(page: Page, credentials: dict):
                             text = await button.text_content() or ''
                             if text_to_find in text:
                                 logger.info(f"Found OK button with text: {text.strip()}")
-                                await button.click()
-                                ok_clicked = True
-                                break
+                                # クリック前に要素の状態を確認
+                                is_visible = await button.is_visible()
+                                is_enabled = await button.is_enabled()
+                                logger.info(f"Button state - visible: {is_visible}, enabled: {is_enabled}")
+                                
+                                if is_visible and is_enabled:
+                                    # 複数のクリック方法を試す
+                                    try:
+                                        await button.click(force=True)  # 強制クリック
+                                    except:
+                                        # JavaScriptでクリック
+                                        await page.evaluate('(element) => element.click()', button)
+                                    ok_clicked = True
+                                    break
                     else:
                         elements = await page.query_selector_all(selector)
                         for button in elements:
@@ -1255,9 +1266,21 @@ async def login_ipat_v2(page: Page, credentials: dict):
                                 'OK' in value.upper() or 'O K' in value.upper() or
                                 '確認' in text or '次へ' in text or '進む' in text):
                                 logger.info(f"Found and clicking OK/confirmation button: text='{text.strip()}', value='{value.strip()}'")
-                                await button.click()
-                                ok_clicked = True
-                                break
+                                
+                                # クリック前に要素の状態を確認
+                                is_visible = await button.is_visible()
+                                is_enabled = await button.is_enabled()
+                                logger.info(f"Button state - visible: {is_visible}, enabled: {is_enabled}")
+                                
+                                if is_visible and is_enabled:
+                                    # 複数のクリック方法を試す
+                                    try:
+                                        await button.click(force=True)  # 強制クリック
+                                    except:
+                                        # JavaScriptでクリック
+                                        await page.evaluate('(element) => element.click()', button)
+                                    ok_clicked = True
+                                    break
                     if ok_clicked:
                         break
                 except Exception as e:
@@ -1287,24 +1310,55 @@ async def login_ipat_v2(page: Page, credentials: dict):
             logger.info(f"Page content after login (first 500 chars): {page_text[:500]}")
         
         # メニューページへの遷移が必要かチェック
-        if '加入者情報' in page_text or '次回から暗証番号' in page_text:
-            logger.info("Still on login page, looking for menu navigation...")
+        if '加入者情報' in (page_text or '') or '次回から暗証番号' in (page_text or '') or 'P-ARS' in (page_text or ''):
+            logger.info("Still on login/confirmation page, looking for menu navigation...")
+            
+            # まず、すべてのクリック可能要素をデバッグ
+            clickable_selectors = ['a', 'img', 'button', 'input[type="button"]', 'input[type="submit"]', 'input[type="image"]']
+            for selector in clickable_selectors:
+                elements = await page.query_selector_all(selector)
+                if elements:
+                    logger.debug(f"Found {len(elements)} {selector} elements on page")
+                    for i, elem in enumerate(elements[:5]):
+                        text = await elem.text_content() or ''
+                        alt = await elem.get_attribute('alt') or ''
+                        href = await elem.get_attribute('href') or ''
+                        onclick = await elem.get_attribute('onclick') or ''
+                        if text.strip() or alt:
+                            logger.debug(f"{selector}[{i}]: text='{text.strip()}', alt='{alt}', href='{href[:50] if href else ''}', onclick='{onclick[:50] if onclick else ''}'")
+            
             # メニューへのリンクを探す
-            menu_links = await page.query_selector_all('a, img')
-            for link in menu_links:
-                text = await link.text_content() or ''
-                alt = await link.get_attribute('alt') or ''
-                href = await link.get_attribute('href') or ''
-                if 'メニュー' in text or 'menu' in text.lower() or 'メイン' in text or 'main' in text.lower():
-                    logger.info(f"Found menu link: {text.strip() or alt}")
-                    await link.click()
-                    await page.wait_for_timeout(3000)
+            menu_found = False
+            for selector in clickable_selectors:
+                elements = await page.query_selector_all(selector)
+                for link in elements:
+                    text = await link.text_content() or ''
+                    alt = await link.get_attribute('alt') or ''
+                    href = await link.get_attribute('href') or ''
+                    onclick = await link.get_attribute('onclick') or ''
+                    
+                    # メニュー関連のキーワードをチェック
+                    menu_keywords = ['メニュー', 'menu', 'メイン', 'main', 'トップ', 'top', '投票', '購入']
+                    if any(keyword in combined.lower() for combined in [text, alt, onclick] for keyword in menu_keywords):
+                        logger.info(f"Found menu element: text='{text.strip()}', alt='{alt}', onclick='{onclick[:50] if onclick else ''}'")
+                        await link.click()
+                        menu_found = True
+                        await page.wait_for_timeout(3000)
+                        break
+                    
+                    # 特定のURLパターンをチェック
+                    if href and any(pattern in href for pattern in ['menu', 'main', 'top', 'home']):
+                        logger.info(f"Found menu link by URL: {href}")
+                        await link.click()
+                        menu_found = True
+                        await page.wait_for_timeout(3000)
+                        break
+                
+                if menu_found:
                     break
-                elif alt and ('メニュー' in alt or 'menu' in alt.lower()):
-                    logger.info(f"Found menu image: {alt}")
-                    await link.click()
-                    await page.wait_for_timeout(3000)
-                    break
+            
+            if not menu_found:
+                logger.warning("Could not find menu navigation link")
         
         # ログイン成功の判定
         success_indicators = ['投票', 'マイページ', '残高', 'メニュー', 'MENU']
@@ -1331,12 +1385,68 @@ async def login_ipat_v2(page: Page, credentials: dict):
         raise
 
 
+async def navigate_to_account_info(page: Page):
+    """口座情報ページへ移動"""
+    try:
+        logger.info("Navigating to account info page...")
+        
+        # 口座情報へのリンクを探す
+        selectors = ['a', 'button', 'img', 'input[type="button"]', 'input[type="submit"]']
+        keywords = ['口座', '残高', '照会', '明細', '入金', '出金', 'account', 'balance']
+        
+        for selector in selectors:
+            elements = await page.query_selector_all(selector)
+            for element in elements:
+                text = await element.text_content() or ''
+                alt = await element.get_attribute('alt') or ''
+                href = await element.get_attribute('href') or ''
+                
+                if any(keyword in combined.lower() for combined in [text, alt] for keyword in keywords):
+                    logger.info(f"Found account info link: text='{text.strip()}', alt='{alt}'")
+                    await element.click()
+                    await page.wait_for_timeout(3000)
+                    return True
+        
+        logger.warning("Could not find account info link")
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to navigate to account info: {e}")
+        return False
+
+
 async def get_balance(page: Page) -> int:
     """残高を取得（動的検出対応）"""
     try:
         logger.info("Getting account balance...")
         await page.wait_for_timeout(4000)
         await take_screenshot(page, "balance_check")
+        
+        # まず現在のページで残高を探す
+        balance = await find_balance_on_page(page)
+        if balance is not None:
+            return balance
+        
+        # 残高が見つからない場合、口座情報ページへ移動を試みる
+        logger.info("Balance not found on current page, trying to navigate to account info...")
+        if await navigate_to_account_info(page):
+            await page.wait_for_timeout(3000)
+            await take_screenshot(page, "account_info_page")
+            balance = await find_balance_on_page(page)
+            if balance is not None:
+                return balance
+        
+        logger.warning("Could not find balance, returning 0")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Failed to get balance: {e}")
+        return 0
+
+
+async def find_balance_on_page(page: Page):
+    """現在のページで残高を探す"""
+    try:
         
         # ページの全テキストをデバッグ
         page_text = await page.text_content('body')
@@ -1384,16 +1494,12 @@ async def get_balance(page: Page) -> int:
                     except (ValueError, IndexError):
                         continue
         
-        # 残高が見つからない場合、メニューページにいる可能性がある
-        logger.info("Balance not found on current page, might need to navigate to account info page")
-        
         # メニューページにいるか確認
         current_url = page.url
         page_title = await page.title()
         logger.info(f"Current page for balance check - URL: {current_url}, Title: {page_title}")
         
-        logger.warning("Could not find balance, returning 0")
-        return 0
+        return None
         
     except Exception as e:
         logger.error(f"Failed to get balance: {e}")
