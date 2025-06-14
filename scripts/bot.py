@@ -2213,11 +2213,21 @@ async def place_bet_from_csv(page: Page, ticket: pd.Series, slack: Optional[Slac
         
         # 投票画面へ移動
         if not await navigate_to_vote(page):
+            if slack:
+                await slack.send_navigation_notification("投票画面", False)
             raise Exception("Failed to navigate to vote page")
+        else:
+            if slack:
+                await slack.send_navigation_notification("投票画面", True)
         
         # レース選択
         if not await select_race(page, racecourse, race_number):
+            if slack:
+                await slack.send_navigation_notification(f"{racecourse} {race_number}R", False)
             raise Exception("Failed to select race")
+        else:
+            if slack:
+                await slack.send_navigation_notification(f"{racecourse} {race_number}R", True)
         
         # 馬選択と投票（Slack通知付き）
         if not await select_horse_and_bet(page, horse_number, horse_name, bet_amount, 
@@ -2311,6 +2321,10 @@ async def main():
                 logger.info("🚀 STARTING AKATSUKI BOT V2 - FULL AUTOMATED BETTING SESSION")
                 logger.info(f"⏰ Session started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
+                # セッション開始をSlackに通知
+                if slack_bets:
+                    await slack_bets.send_session_start_notification()
+                
                 # まずHTTPベースで分析を実行
                 logger.info("📡 STEP 0: Pre-flight site analysis...")
                 http_analysis = await http_based_site_analysis()
@@ -2335,9 +2349,11 @@ async def main():
                         login_duration = (datetime.now() - login_start).total_seconds()
                         logger.info(f"✓ Login successful in {login_duration:.1f}s")
                         if slack_bets:
-                            await slack_bets.send_message(f"🔐 ログイン成功 ({login_duration:.1f}s)")
+                            await slack_bets.send_login_notification(True, login_duration)
                     except Exception as login_error:
                         logger.error(f"❌ Login failed: {login_error}")
+                        if slack_alerts:
+                            await slack_alerts.send_login_notification(False, error_message=str(login_error))
                         raise Exception(f"STEP 1 FAILED: {login_error}")
                     
                     # STEP 2: 残高確認
@@ -2349,14 +2365,18 @@ async def main():
                         if balance is not None:
                             logger.info(f"✓ Current balance: {balance:,} yen (checked in {balance_duration:.1f}s)")
                             if slack_bets:
-                                await slack_bets.send_message(f"💰 現在残高: {balance:,}円")
+                                await slack_bets.send_balance_notification(balance, "初期確認")
                         else:
                             logger.warning("⚠️ Could not retrieve balance, using fallback")
                             balance = 50000  # フォールバック値
+                            if slack_alerts:
+                                await slack_alerts.send_error_notification("残高取得失敗", "フォールバック値(50,000円)を使用")
                     except Exception as balance_error:
                         logger.error(f"❌ Balance check failed: {balance_error}")
                         balance = 50000  # フォールバック値
                         logger.info(f"📝 Using fallback balance: {balance:,} yen")
+                        if slack_alerts:
+                            await slack_alerts.send_error_notification("残高確認エラー", str(balance_error))
                     
                     # STEP 3: 入金チェック
                     logger.info("🏧 STEP 3: DEPOSIT CHECK...")
@@ -2364,18 +2384,29 @@ async def main():
                         deposit_start = datetime.now()
                         deposit_needed = deposit_amount - balance
                         logger.info(f"💳 Balance {balance:,} < required {deposit_amount:,}, depositing {deposit_needed:,} yen...")
+                        
+                        # 入金開始通知
+                        if slack_bets:
+                            await slack_bets.send_deposit_start_notification(deposit_needed, balance)
+                        
                         try:
                             await retry_async(auto_deposit_v2, page, deposit_needed, 
                                             credentials['password'], slack_bets)
                             deposit_duration = (datetime.now() - deposit_start).total_seconds()
                             logger.info(f"✓ Deposit completed in {deposit_duration:.1f}s")
                             balance = deposit_amount  # 更新
+                            
+                            # 入金後の残高確認通知
+                            if slack_bets:
+                                await slack_bets.send_balance_notification(balance, "入金後")
                         except Exception as deposit_error:
                             logger.error(f"❌ Deposit failed: {deposit_error}")
                             if slack_alerts:
                                 await slack_alerts.send_error_notification("入金エラー", str(deposit_error))
                     else:
                         logger.info(f"✓ Sufficient balance: {balance:,} yen")
+                        if slack_bets:
+                            await slack_bets.send_message(f"✅ 十分な残高があります: ¥{balance:,}")
                     
                     # STEP 4: チケット処理・投票実行
                     logger.info("🎫 STEP 4: BETTING EXECUTION...")
@@ -2397,6 +2428,8 @@ async def main():
                         
                         if tickets_df is None:
                             logger.error("❌ Failed to read CSV with any encoding")
+                            if slack_alerts:
+                                await slack_alerts.send_error_notification("CSVファイル読み込みエラー", "すべてのエンコーディングで失敗")
                             raise Exception("Could not read tickets.csv with any encoding")
                         
                         total_tickets = len(tickets_df)
@@ -2458,6 +2491,8 @@ async def main():
                         
                     else:
                         logger.warning("⚠️ No tickets.csv found, skipping betting phase")
+                        if slack_bets:
+                            await slack_bets.send_message("⚠️ tickets.csvが見つかりません。投票をスキップします。")
                     
                     # STEP 5: 最終残高確認
                     logger.info("💰 STEP 5: FINAL BALANCE CHECK...")
@@ -2469,14 +2504,20 @@ async def main():
                         if final_balance is not None:
                             balance_change = final_balance - balance if balance else 0
                             logger.info(f"✓ Final balance: {final_balance:,} yen (change: {balance_change:+,} yen) [checked in {final_balance_duration:.1f}s]")
+                            if slack_bets:
+                                await slack_bets.send_balance_notification(final_balance, "最終確認")
                         else:
                             logger.warning("⚠️ Could not retrieve final balance")
                             final_balance = balance - total_amount  # 概算
                             logger.info(f"📝 Estimated final balance: {final_balance:,} yen")
+                            if slack_alerts:
+                                await slack_alerts.send_error_notification("最終残高取得失敗", f"推定値: ¥{final_balance:,}")
                     except Exception as final_balance_error:
                         logger.error(f"❌ Final balance check failed: {final_balance_error}")
                         final_balance = balance - total_amount  # 概算
                         logger.info(f"📝 Estimated final balance: {final_balance:,} yen")
+                        if slack_alerts:
+                            await slack_alerts.send_error_notification("最終残高確認エラー", str(final_balance_error))
                     
                     # STEP 6: 包括的サマリー通知
                     logger.info("📊 STEP 6: SESSION SUMMARY...")
