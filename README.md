@@ -178,6 +178,63 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+### 6.3 2段階INET-IDログイン
+
+JRA IPATではPC版サイト (`https://www.ipat.jra.go.jp/`) でログインする際、2段階認証が必要です：
+
+**Stage 1**: INET-IDを入力してログイン
+```python
+await page.fill('input[name="inetid"]', credentials['inet_id'])
+await page.click('.button')
+```
+
+**Stage 2**: 加入者番号、暗証番号、P-ARS番号を入力
+```python
+await page.fill('input[name="i"]', credentials['user_id'])
+await page.fill('input[name="p"]', credentials['password'])
+await page.fill('input[name="r"]', credentials['pars'])
+await page.click('.buttonModern')
+```
+
+### 6.4 セッション管理（再ログインスキップ機能）
+
+ログイン成功後、ブラウザのセッション情報（Cookie等）を`output/session.json`に保存します。
+
+**初回実行時**:
+```python
+# ログイン後、セッション情報を保存
+await context.storage_state(path="output/session.json")
+```
+
+**2回目以降の実行時**:
+```python
+# 保存されたセッション情報でブラウザを起動
+context = await browser.new_context(storage_state="output/session.json")
+
+# ログイン状態を確認
+await page.goto(IPAT_URL)
+page_text = await page.evaluate("document.body.innerText")
+
+# ログインフォームが表示されている = セッション期限切れ
+if "INET-ID" in page_text or "加入者番号" in page_text:
+    # 自動的に再ログイン
+    await login_simple(page, credentials)
+    await context.storage_state(path="output/session.json")
+else:
+    # セッション有効、ログインスキップ
+    logger.info("✓ Session is still valid")
+```
+
+**メリット**:
+- 2回目以降の起動時、セッションが有効であればログイン処理をスキップ
+- ログイン失敗によるアカウントロックのリスクを軽減
+- 処理時間の短縮
+
+**セッション有効期限**:
+- JRAサーバー側の設定に依存（通常30分〜数時間程度と推測）
+- 期限切れの場合は自動的に再ログインを実行
+- セッション情報は`output/session.json`に保存され、永続化されます
+
 ---
 
 ## 7. CI/CD (将来実装)

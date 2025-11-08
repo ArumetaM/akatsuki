@@ -3,6 +3,7 @@
 import os
 import logging
 from typing import Optional
+from datetime import datetime
 import aiohttp
 import json
 
@@ -185,4 +186,165 @@ class SlackNotifier:
         ]
         
         text = f"投票完了: {total_bets}件 総額¥{total_amount:,} 残高¥{final_balance:,}"
+        await self.send_message(text, blocks)
+    
+    async def send_session_start_notification(self):
+        """セッション開始通知を送信"""
+        from datetime import datetime
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚀 AKATSUKI BOT セッション開始"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*開始時刻:*\n{current_time}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": "*状態:*\n稼働中"
+                    }
+                ]
+            }
+        ]
+        
+        text = f"AKATSUKI BOT セッション開始 - {current_time}"
+        await self.send_message(text, blocks)
+    
+    async def send_login_notification(self, success: bool, duration: float = None, error_message: str = None):
+        """ログイン通知を送信"""
+        if success:
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🔐 ログイン成功"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "*状態:*\n認証完了"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*処理時間:*\n{duration:.1f}秒" if duration else "*処理時間:*\n-"
+                        }
+                    ]
+                }
+            ]
+            text = f"ログイン成功 ({duration:.1f}秒)" if duration else "ログイン成功"
+        else:
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "❌ ログイン失敗"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "*状態:*\n認証エラー"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*エラー:*\n{error_message}" if error_message else "*エラー:*\n不明"
+                        }
+                    ]
+                }
+            ]
+            text = f"ログイン失敗: {error_message}" if error_message else "ログイン失敗"
+        
+        await self.send_message(text, blocks)
+    
+    async def send_balance_notification(self, balance: int, context: str = "確認"):
+        """残高通知を送信"""
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"💰 残高{context}"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*現在残高:*\n¥{balance:,}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*確認時刻:*\n{datetime.now().strftime('%H:%M:%S')}"
+                    }
+                ]
+            }
+        ]
+        
+        text = f"残高{context}: ¥{balance:,}"
+        await self.send_message(text, blocks)
+    
+    async def send_deposit_start_notification(self, amount: int, current_balance: int):
+        """入金開始通知を送信"""
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🏧 入金処理開始"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*現在残高:*\n¥{current_balance:,}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*入金予定額:*\n¥{amount:,}"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*入金後予定残高:*\n¥{current_balance + amount:,}"
+                    }
+                ]
+            }
+        ]
+        
+        text = f"入金開始: ¥{amount:,} (現在残高: ¥{current_balance:,})"
+        await self.send_message(text, blocks)
+    
+    async def send_navigation_notification(self, page_name: str, success: bool = True):
+        """ページ遷移通知を送信"""
+        emoji = "✅" if success else "⚠️"
+        
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{emoji} {page_name}へ{'遷移成功' if success else '遷移失敗'}"
+                }
+            }
+        ]
+        
+        text = f"{page_name}へ{'遷移成功' if success else '遷移失敗'}"
         await self.send_message(text, blocks)
