@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # 定数
 IPAT_URL = "https://www.ipat.jra.go.jp/"
+IPAT_HOME_URL = "https://www.ipat.jra.go.jp/2017/pw_890_i.cgi#!/"
 
 
 async def get_all_secrets():
@@ -374,12 +375,58 @@ async def navigate_to_vote_simple(page: Page):
         logger.info("📋 Navigating to vote page...")
 
         # ページが完全に読み込まれるまで待つ
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(2000)
         await take_screenshot(page, "before_vote_navigation")
 
         # ページのHTMLをデバッグ出力
         page_content = await page.content()
         logger.info(f"Page content length: {len(page_content)}")
+
+        # 既に投票選択画面にいるかチェック（競馬場タブが表示されていて、モーダルがない）
+        racecourse_tabs = await page.query_selector_all('[class*="jyoTab"], [class*="field"]')
+        modals = await page.query_selector_all('.modal, [class*="dialog"]')
+        visible_modals = []
+        for modal in modals:
+            if await modal.is_visible():
+                visible_modals.append(modal)
+
+        if len(racecourse_tabs) >= 3 and len(visible_modals) == 0:
+            logger.info("✓ Already on clean vote page, skipping navigation")
+            await take_screenshot(page, "vote_page")
+            return True
+
+        # モーダルがある場合は閉じる試み - 複数の方法で
+        if len(visible_modals) > 0:
+            logger.info(f"Found {len(visible_modals)} visible modals, trying to close...")
+            # 方法1: OK/閉じるボタンを探してクリック
+            all_buttons = await page.query_selector_all('button, input[type="button"]')
+            for btn in all_buttons:
+                try:
+                    if await btn.is_visible():
+                        text = await btn.text_content()
+                        if text and ("OK" in text or "閉じる" in text):
+                            await btn.click()
+                            logger.info(f"✓ Clicked close button: {text.strip()}")
+                            await page.wait_for_timeout(1000)
+                            break
+                except:
+                    pass
+
+        # 投票メニューリンクを探してクリック（トップメニューから投票選択画面へ）
+        all_links = await page.query_selector_all('a, button, div[ng-click]')
+        for link in all_links:
+            try:
+                text = await link.text_content()
+                if text and "投票メニュー" in text:
+                    logger.info("✓ Clicking '投票メニュー' link to reset vote page")
+                    await link.click()
+                    await page.wait_for_timeout(2000)
+                    # ここから通常投票ボタンを探す
+                    break
+            except:
+                pass
+
+        await page.wait_for_timeout(2000)
 
         # すべてのボタンをデバッグ出力
         buttons = await page.query_selector_all('button')
@@ -395,6 +442,28 @@ async def navigate_to_vote_simple(page: Page):
                 await button.click()
                 logger.info(f"✓ Clicked vote button: {text.strip()}")
                 await page.wait_for_timeout(4000)
+
+                # 投票ボタンクリック後にモーダルが出る場合があるので再度チェック
+                try:
+                    post_click_modals = await page.query_selector_all('.modal, [class*="dialog"], [role="dialog"]')
+                    for modal in post_click_modals:
+                        if await modal.is_visible():
+                            # "このまま進む" や "OK" ボタンを探してクリック
+                            modal_buttons = await modal.query_selector_all('button, input[type="button"]')
+                            for mbtn in modal_buttons:
+                                try:
+                                    mtext = await mbtn.text_content()
+                                    if mtext and ("このまま進む" in mtext or "OK" in mtext or "進む" in mtext):
+                                        await mbtn.click()
+                                        logger.info(f"✓ Closed post-vote modal: {mtext.strip()}")
+                                        await page.wait_for_timeout(2000)
+                                        break
+                                except:
+                                    pass
+                            break
+                except Exception as e:
+                    logger.debug(f"No post-vote modals: {e}")
+
                 await take_screenshot(page, "vote_page")
                 return True
 
@@ -430,38 +499,103 @@ async def select_race_simple(page: Page, racecourse: str, race_number: int):
     try:
         logger.info(f"🏇 Selecting {racecourse} R{race_number}...")
 
-        # 曜日を取得
-        dt_now = datetime.now().weekday()
-        weekday_list = ["月", "火", "水", "木", "金", "土", "日"]
-        field_name = f"{racecourse}（{weekday_list[dt_now]}）"
+        # 競馬場の選択（曜日に関係なくマッチさせる）
+        # buttons, links, and clickable divs を全て検索
+        all_clickables = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
+        logger.info(f"Found {len(all_clickables)} clickable elements")
 
-        # 競馬場の選択
-        buttons = await page.query_selector_all('button')
-        for button in buttons:
-            text = await button.text_content()
-            if text and field_name in text:
-                await button.click()
-                logger.info(f"✓ Selected racecourse: {field_name}")
-                break
-
-        await page.wait_for_timeout(2000)
-
-        # レースの選択
-        race_text = f"{race_number}R"
-        buttons = await page.query_selector_all('button')
-        for button in buttons:
-            text = await button.text_content()
+        racecourse_button_found = False
+        for i, element in enumerate(all_clickables):
+            text = await element.text_content()
             if text:
-                # "10R"の場合は text[0:3] == "10R"
-                # "9R"の場合は text[0:2] == "9R"
-                if (len(race_text) == 2 and text[0:2] == race_text) or \
-                   (len(race_text) == 3 and text[0:3] == race_text):
-                    await button.click()
-                    logger.info(f"✓ Selected race: {race_text}")
+                text = text.strip()
+                # デバッグ: 最初の50個の要素をログ出力
+                if i < 50:
+                    logger.info(f"  Element[{i}]: '{text[:50]}'")
+                # "福島（土）", "福島（金）" など、競馬場名で始まる要素を検索
+                if text.startswith(racecourse + "（"):
+                    # JavaScriptクリックで確実にクリック（要素が隠れていてもOK）
+                    try:
+                        await element.evaluate("el => el.click()")
+                        logger.info(f"✓ Selected racecourse (JS click): {text}")
+                    except Exception as e:
+                        logger.warning(f"JS click failed, trying normal click: {e}")
+                        await element.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(500)
+                        await element.click()
+                        logger.info(f"✓ Selected racecourse: {text}")
+                    racecourse_button_found = True
                     break
 
-        await page.wait_for_timeout(4000)
+        if not racecourse_button_found:
+            logger.error(f"Racecourse button not found for: {racecourse}")
+            await take_screenshot(page, f"racecourse_not_found_{racecourse}")
+            return False
+
+        # Angularがレース一覧を読み込むまで待つ
+        logger.info("Waiting for race list to load...")
+        await page.wait_for_timeout(3000)
+        await take_screenshot(page, f"after_racecourse_selection_{racecourse}")
+
+        # レースの選択 - buttons と clickable elements の両方を検索
+        race_text = f"{race_number}R"
+        all_race_elements = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
+        logger.info(f"Found {len(all_race_elements)} elements for race selection")
+
+        race_button = None
+        for i, element in enumerate(all_race_elements):
+            text = await element.text_content()
+            if text:
+                text = text.strip()
+                # デバッグ用に最初の20個のレース要素をログ出力
+                if i < 20 and ('R' in text or '(' in text):
+                    logger.info(f"  Race element[{i}]: '{text[:100]}'")
+
+                # "10R (時刻)"のようなフォーマットに対応
+                if text.startswith(race_text):
+                    race_button = element
+                    logger.info(f"✓ Found race button at index {i}: '{text[:50]}'")
+                    break
+
+        if not race_button:
+            logger.error(f"Race button {race_text} not found")
+            await take_screenshot(page, f"race_button_not_found_{racecourse}_{race_number}")
+            return False
+
+        # JavaScriptクリックで確実にクリック
+        try:
+            await race_button.evaluate("el => el.click()")
+            logger.info(f"✓ Clicked race button (JS click): {race_text}")
+        except Exception as e:
+            logger.warning(f"JS click failed on race button, trying normal click: {e}")
+            await race_button.click()
+            logger.info(f"✓ Clicked race button: {race_text}")
+
+        # Angularアプリがレース選択後にDOMを更新するのを待つ
+        # レースボタンに "on" クラスが追加されるまで待機
+        logger.info("Waiting for Angular to update DOM...")
+        try:
+            # レースボタンが "on" クラスを持つまで待つ（最大10秒）
+            for i in range(20):  # 20回 x 500ms = 10秒
+                btn_class = await race_button.get_attribute('class')
+                if btn_class and 'on' in btn_class:
+                    logger.info(f"✓ Race button activated (on class detected) after {i * 0.5}s")
+                    break
+                await page.wait_for_timeout(500)
+            else:
+                logger.warning("Race button didn't get 'on' class within 10 seconds")
+        except Exception as e:
+            logger.warning(f"Error waiting for 'on' class: {e}")
+
+        await page.wait_for_timeout(2000)
         await take_screenshot(page, f"race_selected_{racecourse}_{race_number}")
+
+        # 馬番が表示される領域までスクロール
+        logger.info("Scrolling to horse selection area...")
+        await page.evaluate("window.scrollTo(0, 400);")
+        await page.wait_for_timeout(2000)
+
+        await take_screenshot(page, f"horse_selection_{racecourse}_{race_number}")
         return True
 
     except Exception as e:
@@ -486,13 +620,43 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
                 await page.wait_for_timeout(2000)
 
         # 馬番から買う馬券を選択
+        # デバッグ: HTMLとlabelの情報を保存
+        try:
+            html_content = await page.content()
+            with open("output/horse_selection_page.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info("✓ HTML saved for debugging: output/horse_selection_page.html")
+        except Exception as e:
+            logger.warning(f"Failed to save HTML: {e}")
+
         labels = await page.query_selector_all('label')
-        # Seleniumコードでは cnt=0から始めて、number+8でクリック
-        if len(labels) > horse_number + 8:
-            await labels[horse_number + 8].click()
-            logger.info(f"✓ Horse #{horse_number} selected")
-        else:
-            raise Exception(f"Not enough labels found: {len(labels)} < {horse_number + 8}")
+        logger.info(f"Found {len(labels)} labels on page")
+
+        # 最初の30個のlabelのテキストを出力
+        for i in range(min(30, len(labels))):
+            text = await labels[i].text_content()
+            logger.info(f"  Label[{i}]: {text.strip() if text else '(empty)'}")
+
+        # 固定オフセットではなく、より柔軟な方法を試す
+        # まず単勝エリアのlabelを探す
+        found = False
+        for i, label in enumerate(labels):
+            text = await label.text_content()
+            # 馬番が含まれるlabelを探す（例: "1", "2", "14"など）
+            if text and text.strip() == str(horse_number):
+                logger.info(f"Found label for horse #{horse_number} at index {i}")
+                await label.click()
+                logger.info(f"✓ Horse #{horse_number} selected")
+                found = True
+                break
+
+        if not found:
+            # フォールバック: 旧方式
+            if len(labels) > horse_number + 8:
+                await labels[horse_number + 8].click()
+                logger.info(f"✓ Horse #{horse_number} selected (fallback method)")
+            else:
+                raise Exception(f"Not enough labels found: {len(labels)} < {horse_number + 8}")
 
         await page.wait_for_timeout(2000)
 
@@ -638,7 +802,7 @@ async def main():
                     logger.info("✓ Session is still valid")
 
             # 各チケットを処理
-            for idx, ticket in tickets_df.iterrows():
+            for ticket_idx, (idx, ticket) in enumerate(tickets_df.iterrows()):
                 try:
                     racecourse = ticket['race_course']
                     race_number = int(ticket['race_number'])
@@ -647,9 +811,16 @@ async def main():
                     bet_amount = int(ticket['amount'])
 
                     logger.info(f"\n{'='*60}")
-                    logger.info(f"🎫 Ticket {idx+1}/{len(tickets_df)}")
+                    logger.info(f"🎫 Ticket {ticket_idx+1}/{len(tickets_df)}")
                     logger.info(f"   {racecourse} R{race_number} - #{horse_number} {horse_name} - ¥{bet_amount}")
                     logger.info(f"{'='*60}")
+
+                    # 各チケット処理の前にトップページに戻る（2つ目以降）
+                    if ticket_idx > 0:
+                        logger.info("🔄 Returning to top page...")
+                        await page.goto(IPAT_HOME_URL)
+                        await page.wait_for_timeout(3000)
+                        logger.info("✓ Returned to top page")
 
                     # 投票画面へ移動
                     if not await navigate_to_vote_simple(page):
