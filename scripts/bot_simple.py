@@ -225,138 +225,211 @@ async def get_bet_receipt_links(page: Page) -> int:
         return 0
 
 
-async def parse_bet_receipt_detail(page: Page, idx: int, total_receipts: int) -> Optional[ExistingBet]:
-    """1件の受付番号詳細を解析してExistingBetを返す"""
+async def open_receipt_detail_view(page: Page, idx: int, total_receipts: int) -> Optional[str]:
+    """
+    受付番号詳細ビューを開く
+
+    Args:
+        page: Playwright page
+        idx: 受付番号のインデックス
+        total_receipts: 全受付番号数
+
+    Returns:
+        受付番号文字列（失敗時はNone）
+    """
+    # 毎回リンクを再取得（DOM変更による陳腐化を防ぐ）
+    receipt_links = await page.query_selector_all('.bet-refer-list a[ng-click*="showBetReferDetail"]')
+    if idx >= len(receipt_links):
+        logger.warning(f"⚠️ Receipt {idx} no longer available, skipping")
+        return None
+
+    link = receipt_links[idx]
+    receipt_num = await link.text_content()
+    receipt_num = receipt_num.strip()
+    logger.info(f"📄 Checking receipt {idx+1}/{total_receipts}: {receipt_num}")
+
+    # 詳細ビューを開く
+    await link.click()
+    await page.wait_for_timeout(Timeouts.MEDIUM)
+
+    # 詳細ビューが完全に表示されるまで待つ
     try:
-        # 毎回リンクを再取得（DOM変更による陳腐化を防ぐ）
-        receipt_links = await page.query_selector_all('.bet-refer-list a[ng-click*="showBetReferDetail"]')
-        if idx >= len(receipt_links):
-            logger.warning(f"⚠️ Receipt {idx} no longer available, skipping")
+        await page.wait_for_selector('.bet-refer-result', state='visible', timeout=Timeouts.SELECTOR_WAIT)
+    except:
+        logger.warning("   ⚠️ Detail view not fully loaded")
+
+    return receipt_num
+
+
+async def extract_horse_number(page: Page, html_content: str) -> Optional[int]:
+    """
+    馬番を複数の方法で抽出
+
+    Args:
+        page: Playwright page
+        html_content: ページのHTMLコンテンツ
+
+    Returns:
+        馬番（失敗時はNone）
+    """
+    import re
+    horse_number = None
+
+    # Method 1: CSS selector (推奨)
+    try:
+        horse_elem = await page.query_selector('.horse-combi .set-heading')
+        if horse_elem:
+            horse_text = await horse_elem.text_content()
+            horse_number = int(horse_text.strip())
+            logger.debug(f"   Horse number from CSS: {horse_number}")
+            return horse_number
+    except Exception as e:
+        logger.debug(f"   CSS selector failed: {e}")
+
+    # Method 2: Regex fallback on HTML content
+    horse_match = re.search(r'class="set-heading[^"]*"[^>]*>\s*(\d+)\s*</span>', html_content)
+    if horse_match:
+        horse_number = int(horse_match.group(1))
+        logger.debug(f"   Horse number from regex: {horse_number}")
+        return horse_number
+
+    # Method 3: Print version fallback on HTML content
+    horse_match = re.search(r'ng-switch-when="\d+"[^>]*>\s*(\d+)\s*</span>', html_content)
+    if horse_match:
+        horse_number = int(horse_match.group(1))
+        logger.debug(f"   Horse number from print version: {horse_number}")
+        return horse_number
+
+    # Method 4: Simple pattern in text - look for 馬番 in isolation
+    horse_match = re.search(r'ng-bind="vm\.header\.horse\d+">(\d+)</span>', html_content)
+    if horse_match:
+        horse_number = int(horse_match.group(1))
+        logger.debug(f"   Horse number from ng-bind pattern: {horse_number}")
+        return horse_number
+
+    return None
+
+
+async def extract_bet_info_from_page(page: Page, idx: int) -> dict:
+    """
+    ページから馬券情報を抽出
+
+    Args:
+        page: Playwright page
+        idx: 受付番号のインデックス
+
+    Returns:
+        馬券情報の辞書
+    """
+    import re
+
+    # 詳細ビューのHTMLを解析
+    html_content = await page.content()
+    page_text = await page.text_content('body')
+
+    # 最初のレコードのために詳細ビューのHTMLを保存（デバッグ用）
+    if idx == 0:
+        with open('output/bet_detail_first.html', 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        await take_screenshot(page, "bet_detail_first")
+        logger.info("✓ Saved first bet detail HTML for debugging")
+
+    # テキストから情報を抽出
+    # 1. レース場
+    racecourse_match = re.search(r'(東京|京都|阪神|中山|小倉|福島|新潟|札幌|函館|中京)', page_text)
+    racecourse = racecourse_match.group(1) if racecourse_match else None
+
+    # 2. レース番号
+    race_num_match = re.search(r'(\d+)R', page_text)
+    race_number = int(race_num_match.group(1)) if race_num_match else None
+
+    # 3. 式別
+    bet_type_match = re.search(r'(単勝|複勝|馬連|馬単|ワイド|三連複|三連単)', page_text)
+    bet_type = bet_type_match.group(1) if bet_type_match else None
+
+    # 4. 金額
+    amount_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*円', page_text)
+    amount = int(amount_match.group(1).replace(',', '')) if amount_match else None
+
+    # 5. 馬番
+    horse_number = await extract_horse_number(page, html_content)
+
+    return {
+        'racecourse': racecourse,
+        'race_number': race_number,
+        'bet_type': bet_type,
+        'horse_number': horse_number,
+        'amount': amount
+    }
+
+
+async def close_receipt_detail_view(page: Page):
+    """
+    詳細ビューを閉じて一覧に戻る
+
+    Args:
+        page: Playwright page
+    """
+    back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
+    if back_button:
+        await back_button.click()
+        await page.wait_for_timeout(Timeouts.SHORT)
+    else:
+        logger.warning("⚠️ Could not find back button, trying close button")
+        close_button = await page.query_selector('button[ng-click="vm.close()"]')
+        if close_button:
+            await close_button.click()
+            await page.wait_for_timeout(Timeouts.SHORT)
+
+
+async def parse_bet_receipt_detail(page: Page, idx: int, total_receipts: int) -> Optional[ExistingBet]:
+    """
+    1件の受付番号詳細を解析してExistingBetを返す
+
+    Args:
+        page: Playwright page
+        idx: 受付番号のインデックス
+        total_receipts: 全受付番号数
+
+    Returns:
+        ExistingBet（失敗時はNone）
+    """
+    try:
+        # 1. 詳細ビューを開く
+        receipt_num = await open_receipt_detail_view(page, idx, total_receipts)
+        if receipt_num is None:
             return None
 
-        link = receipt_links[idx]
-        receipt_num = await link.text_content()
-        receipt_num = receipt_num.strip()
-        logger.info(f"📄 Checking receipt {idx+1}/{total_receipts}: {receipt_num}")
+        # 2. 馬券情報を抽出
+        bet_info = await extract_bet_info_from_page(page, idx)
 
-        # 詳細ビューを開く
-        await link.click()
-        await page.wait_for_timeout(Timeouts.MEDIUM)
-
-        # 詳細ビューが完全に表示されるまで待つ
-        try:
-            await page.wait_for_selector('.bet-refer-result', state='visible', timeout=Timeouts.SELECTOR_WAIT)
-        except:
-            logger.warning("   ⚠️ Detail view not fully loaded")
-
-        # 詳細ビューのHTMLを解析
-        html_content = await page.content()
-        page_text = await page.text_content('body')
-
-        # 最初のレコードのために詳細ビューのHTMLを保存（デバッグ用）
-        if idx == 0:
-            with open('output/bet_detail_first.html', 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            await take_screenshot(page, "bet_detail_first")
-            logger.info("✓ Saved first bet detail HTML for debugging")
-
-        # テキストから情報を抽出
-        import re
-
-        # 1. レース場
-        racecourse_match = re.search(r'(東京|京都|阪神|中山|小倉|福島|新潟|札幌|函館|中京)', page_text)
-        racecourse = racecourse_match.group(1) if racecourse_match else None
-
-        # 2. レース番号
-        race_num_match = re.search(r'(\d+)R', page_text)
-        race_number = int(race_num_match.group(1)) if race_num_match else None
-
-        # 3. 式別
-        bet_type_match = re.search(r'(単勝|複勝|馬連|馬単|ワイド|三連複|三連単)', page_text)
-        bet_type = bet_type_match.group(1) if bet_type_match else None
-
-        # 4. 金額
-        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*円', page_text)
-        amount = int(amount_match.group(1).replace(',', '')) if amount_match else None
-
-        # 5. 馬番（CSS セレクタ優先、regex フォールバック）
-        horse_number = None
-
-        # Method 1: CSS selector (推奨)
-        try:
-            horse_elem = await page.query_selector('.horse-combi .set-heading')
-            if horse_elem:
-                horse_text = await horse_elem.text_content()
-                horse_number = int(horse_text.strip())
-                logger.debug(f"   Horse number from CSS: {horse_number}")
-        except Exception as e:
-            logger.debug(f"   CSS selector failed: {e}")
-
-        # Method 2: Regex fallback on HTML content
-        if horse_number is None:
-            horse_match = re.search(r'class="set-heading[^"]*"[^>]*>\s*(\d+)\s*</span>', html_content)
-            if horse_match:
-                horse_number = int(horse_match.group(1))
-                logger.debug(f"   Horse number from regex: {horse_number}")
-
-        # Method 3: Print version fallback on HTML content
-        if horse_number is None:
-            horse_match = re.search(r'ng-switch-when="\d+"[^>]*>\s*(\d+)\s*</span>', html_content)
-            if horse_match:
-                horse_number = int(horse_match.group(1))
-                logger.debug(f"   Horse number from print version: {horse_number}")
-
-        # Method 4: Simple pattern in text - look for 馬番 in isolation
-        if horse_number is None:
-            # Find horse number in the page text near "馬券表示" section
-            horse_match = re.search(r'ng-bind="vm\.header\.horse\d+">(\d+)</span>', html_content)
-            if horse_match:
-                horse_number = int(horse_match.group(1))
-                logger.debug(f"   Horse number from ng-bind pattern: {horse_number}")
-
-        # すべてのフィールドが取得できたか確認
-        if all([racecourse, race_number, bet_type, horse_number, amount]):
+        # 3. すべてのフィールドが取得できたか確認
+        if all([bet_info['racecourse'], bet_info['race_number'], bet_info['bet_type'],
+                bet_info['horse_number'], bet_info['amount']]):
             existing_bet = ExistingBet(
                 receipt_number=receipt_num,
-                racecourse=racecourse,
-                race_number=race_number,
-                bet_type=bet_type,
-                horse_number=horse_number,
-                amount=amount
+                racecourse=bet_info['racecourse'],
+                race_number=bet_info['race_number'],
+                bet_type=bet_info['bet_type'],
+                horse_number=bet_info['horse_number'],
+                amount=bet_info['amount']
             )
-            logger.info(f"   ✓ Parsed: {racecourse} {race_number}R {bet_type} {horse_number}番 {amount}円")
+            logger.info(f"   ✓ Parsed: {bet_info['racecourse']} {bet_info['race_number']}R {bet_info['bet_type']} {bet_info['horse_number']}番 {bet_info['amount']}円")
 
-            # 詳細ビューから一覧に戻る
-            back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
-            if back_button:
-                await back_button.click()
-                await page.wait_for_timeout(Timeouts.SHORT)
-            else:
-                logger.warning("⚠️ Could not find back button, trying close button")
-                close_button = await page.query_selector('button[ng-click="vm.close()"]')
-                if close_button:
-                    await close_button.click()
-                    await page.wait_for_timeout(Timeouts.SHORT)
-
+            # 4. 詳細ビューを閉じる
+            await close_receipt_detail_view(page)
             return existing_bet
         else:
             logger.warning(f"   ⚠️ Could not parse all fields")
-            logger.warning(f"      racecourse={racecourse}, race={race_number}, type={bet_type}, horse={horse_number}, amount={amount}")
+            logger.warning(f"      racecourse={bet_info['racecourse']}, race={bet_info['race_number']}, type={bet_info['bet_type']}, horse={bet_info['horse_number']}, amount={bet_info['amount']}")
+            await close_receipt_detail_view(page)
             return None
 
     except Exception as e:
         logger.warning(f"Failed to parse receipt {idx+1}: {e}")
         # エラー時も一覧に戻るボタンを試す
         try:
-            back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
-            if back_button:
-                await back_button.click()
-                await page.wait_for_timeout(Timeouts.SHORT)
-            else:
-                close_button = await page.query_selector('button[ng-click="vm.close()"]')
-                if close_button:
-                    await close_button.click()
-                    await page.wait_for_timeout(Timeouts.SHORT)
+            await close_receipt_detail_view(page)
         except:
             pass
         return None
