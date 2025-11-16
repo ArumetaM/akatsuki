@@ -1287,108 +1287,171 @@ async def navigate_to_vote_simple(page: Page):
         return False
 
 
+async def find_and_click_racecourse_button(page: Page, racecourse: str) -> bool:
+    """
+    競馬場ボタンを検索してクリック
+
+    Args:
+        page: Playwright page
+        racecourse: 競馬場名（例: "東京", "福島"）
+
+    Returns:
+        クリックに成功したらTrue
+    """
+    # buttons, links, and clickable divs を全て検索
+    all_clickables = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
+    logger.info(f"Found {len(all_clickables)} clickable elements")
+
+    for i, element in enumerate(all_clickables):
+        text = await element.text_content()
+        if text:
+            text = text.strip()
+            # デバッグ: 最初の50個の要素をログ出力
+            if i < 50:
+                logger.info(f"  Element[{i}]: '{text[:50]}'")
+            # "福島（土）", "福島（金）" など、競馬場名で始まる要素を検索
+            if text.startswith(racecourse + "（"):
+                # JavaScriptクリックで確実にクリック（要素が隠れていてもOK）
+                try:
+                    await element.evaluate("el => el.click()")
+                    logger.info(f"✓ Selected racecourse (JS click): {text}")
+                except Exception as e:
+                    logger.warning(f"JS click failed, trying normal click: {e}")
+                    await element.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(500)
+                    await element.click()
+                    logger.info(f"✓ Selected racecourse: {text}")
+                return True
+
+    logger.error(f"Racecourse button not found for: {racecourse}")
+    await take_screenshot(page, f"racecourse_not_found_{racecourse}")
+    return False
+
+
+async def find_and_click_race_button(page: Page, racecourse: str, race_number: int) -> tuple[bool, Optional[any]]:
+    """
+    レースボタンを検索してクリック
+
+    Args:
+        page: Playwright page
+        racecourse: 競馬場名
+        race_number: レース番号
+
+    Returns:
+        (成功したか, クリックしたレースボタン要素)
+    """
+    race_text = f"{race_number}R"
+    all_race_elements = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
+    logger.info(f"Found {len(all_race_elements)} elements for race selection")
+
+    race_button = None
+    for i, element in enumerate(all_race_elements):
+        text = await element.text_content()
+        if text:
+            text = text.strip()
+            # デバッグ用に最初の20個のレース要素をログ出力
+            if i < 20 and ('R' in text or '(' in text):
+                logger.info(f"  Race element[{i}]: '{text[:100]}'")
+
+            # "10R (時刻)"のようなフォーマットに対応
+            if text.startswith(race_text):
+                race_button = element
+                logger.info(f"✓ Found race button at index {i}: '{text[:50]}'")
+                break
+
+    if not race_button:
+        logger.error(f"Race button {race_text} not found")
+        await take_screenshot(page, f"race_button_not_found_{racecourse}_{race_number}")
+        return False, None
+
+    # JavaScriptクリックで確実にクリック
+    try:
+        await race_button.evaluate("el => el.click()")
+        logger.info(f"✓ Clicked race button (JS click): {race_text}")
+    except Exception as e:
+        logger.warning(f"JS click failed on race button, trying normal click: {e}")
+        await race_button.click()
+        logger.info(f"✓ Clicked race button: {race_text}")
+
+    return True, race_button
+
+
+async def wait_for_race_button_activation(page: Page, race_button):
+    """
+    レースボタンがアクティブ化（"on"クラス追加）されるまで待機
+
+    Args:
+        page: Playwright page
+        race_button: レースボタン要素
+    """
+    logger.info("Waiting for Angular to update DOM...")
+    try:
+        # レースボタンが "on" クラスを持つまで待つ（最大10秒）
+        for i in range(20):  # 20回 x 500ms = 10秒
+            btn_class = await race_button.get_attribute('class')
+            if btn_class and 'on' in btn_class:
+                logger.info(f"✓ Race button activated (on class detected) after {i * 0.5}s")
+                break
+            await page.wait_for_timeout(500)
+        else:
+            logger.warning("Race button didn't get 'on' class within 10 seconds")
+    except Exception as e:
+        logger.warning(f"Error waiting for 'on' class: {e}")
+
+
+async def scroll_to_horse_selection_area(page: Page, racecourse: str, race_number: int):
+    """
+    馬番選択エリアまでスクロール
+
+    Args:
+        page: Playwright page
+        racecourse: 競馬場名
+        race_number: レース番号
+    """
+    logger.info("Scrolling to horse selection area...")
+    await page.evaluate("window.scrollTo(0, 400);")
+    await page.wait_for_timeout(Timeouts.MEDIUM)
+    await take_screenshot(page, f"horse_selection_{racecourse}_{race_number}")
+
+
 async def select_race_simple(page: Page, racecourse: str, race_number: int):
-    """競馬場とレースを選択（シンプル版）"""
+    """
+    競馬場とレースを選択（シンプル版）
+
+    Args:
+        page: Playwright page
+        racecourse: 競馬場名
+        race_number: レース番号
+
+    Returns:
+        成功したらTrue
+    """
     try:
         logger.info(f"🏇 Selecting {racecourse} R{race_number}...")
 
-        # 競馬場の選択（曜日に関係なくマッチさせる）
-        # buttons, links, and clickable divs を全て検索
-        all_clickables = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
-        logger.info(f"Found {len(all_clickables)} clickable elements")
-
-        racecourse_button_found = False
-        for i, element in enumerate(all_clickables):
-            text = await element.text_content()
-            if text:
-                text = text.strip()
-                # デバッグ: 最初の50個の要素をログ出力
-                if i < 50:
-                    logger.info(f"  Element[{i}]: '{text[:50]}'")
-                # "福島（土）", "福島（金）" など、競馬場名で始まる要素を検索
-                if text.startswith(racecourse + "（"):
-                    # JavaScriptクリックで確実にクリック（要素が隠れていてもOK）
-                    try:
-                        await element.evaluate("el => el.click()")
-                        logger.info(f"✓ Selected racecourse (JS click): {text}")
-                    except Exception as e:
-                        logger.warning(f"JS click failed, trying normal click: {e}")
-                        await element.scroll_into_view_if_needed()
-                        await page.wait_for_timeout(500)
-                        await element.click()
-                        logger.info(f"✓ Selected racecourse: {text}")
-                    racecourse_button_found = True
-                    break
-
-        if not racecourse_button_found:
-            logger.error(f"Racecourse button not found for: {racecourse}")
-            await take_screenshot(page, f"racecourse_not_found_{racecourse}")
+        # 1. 競馬場ボタンを検索してクリック
+        if not await find_and_click_racecourse_button(page, racecourse):
             return False
 
-        # Angularがレース一覧を読み込むまで待つ
+        # 2. Angularがレース一覧を読み込むまで待つ
         logger.info("Waiting for race list to load...")
         await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, f"after_racecourse_selection_{racecourse}")
 
-        # レースの選択 - buttons と clickable elements の両方を検索
-        race_text = f"{race_number}R"
-        all_race_elements = await page.query_selector_all('button, a, div[ng-click], span[ng-click]')
-        logger.info(f"Found {len(all_race_elements)} elements for race selection")
-
-        race_button = None
-        for i, element in enumerate(all_race_elements):
-            text = await element.text_content()
-            if text:
-                text = text.strip()
-                # デバッグ用に最初の20個のレース要素をログ出力
-                if i < 20 and ('R' in text or '(' in text):
-                    logger.info(f"  Race element[{i}]: '{text[:100]}'")
-
-                # "10R (時刻)"のようなフォーマットに対応
-                if text.startswith(race_text):
-                    race_button = element
-                    logger.info(f"✓ Found race button at index {i}: '{text[:50]}'")
-                    break
-
-        if not race_button:
-            logger.error(f"Race button {race_text} not found")
-            await take_screenshot(page, f"race_button_not_found_{racecourse}_{race_number}")
+        # 3. レースボタンを検索してクリック
+        success, race_button = await find_and_click_race_button(page, racecourse, race_number)
+        if not success:
             return False
 
-        # JavaScriptクリックで確実にクリック
-        try:
-            await race_button.evaluate("el => el.click()")
-            logger.info(f"✓ Clicked race button (JS click): {race_text}")
-        except Exception as e:
-            logger.warning(f"JS click failed on race button, trying normal click: {e}")
-            await race_button.click()
-            logger.info(f"✓ Clicked race button: {race_text}")
-
-        # Angularアプリがレース選択後にDOMを更新するのを待つ
-        # レースボタンに "on" クラスが追加されるまで待機
-        logger.info("Waiting for Angular to update DOM...")
-        try:
-            # レースボタンが "on" クラスを持つまで待つ（最大10秒）
-            for i in range(20):  # 20回 x 500ms = 10秒
-                btn_class = await race_button.get_attribute('class')
-                if btn_class and 'on' in btn_class:
-                    logger.info(f"✓ Race button activated (on class detected) after {i * 0.5}s")
-                    break
-                await page.wait_for_timeout(500)
-            else:
-                logger.warning("Race button didn't get 'on' class within 10 seconds")
-        except Exception as e:
-            logger.warning(f"Error waiting for 'on' class: {e}")
+        # 4. レースボタンのアクティブ化待機
+        await wait_for_race_button_activation(page, race_button)
 
         await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, f"race_selected_{racecourse}_{race_number}")
 
-        # 馬番が表示される領域までスクロール
-        logger.info("Scrolling to horse selection area...")
-        await page.evaluate("window.scrollTo(0, 400);")
-        await page.wait_for_timeout(Timeouts.MEDIUM)
+        # 5. 馬番選択エリアまでスクロール
+        await scroll_to_horse_selection_area(page, racecourse, race_number)
 
-        await take_screenshot(page, f"horse_selection_{racecourse}_{race_number}")
         return True
 
     except Exception as e:
