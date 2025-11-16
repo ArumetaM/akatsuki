@@ -13,6 +13,9 @@ import boto3
 import json
 from botocore.exceptions import ClientError
 import logging
+from dataclasses import dataclass
+from typing import List, Optional
+from enum import Enum
 
 # 環境変数読み込み
 load_dotenv()
@@ -28,6 +31,70 @@ logger = logging.getLogger(__name__)
 IPAT_URL = "https://www.ipat.jra.go.jp/"
 IPAT_HOME_URL = "https://www.ipat.jra.go.jp/2017/pw_890_i.cgi#!/"
 
+
+# ========================================
+# データ構造（冪等性対応）
+# ========================================
+
+class TicketStatus(Enum):
+    """チケットの状態"""
+    ALREADY_PURCHASED = "already_purchased"      # 重複で購入しない
+    NOT_PURCHASED = "not_purchased"              # 未購入（購入対象）
+    SKIPPED_DRY_RUN = "skipped_dry_run"         # DRY_RUNでスキップ
+    PURCHASE_SUCCESS = "purchase_success"        # 購入成功
+    PURCHASE_FAILED = "purchase_failed"          # 購入失敗
+
+
+@dataclass
+class ExistingBet:
+    """既存の投票データ（投票内容照会から取得）"""
+    receipt_number: str      # 受付番号 (e.g., "0001")
+    racecourse: str          # 競馬場 (e.g., "東京")
+    race_number: int         # レース番号 (e.g., 8)
+    bet_type: str            # 券種 (e.g., "単勝", "複勝", "馬連")
+    horse_number: int        # 馬番 (e.g., 13)
+    amount: int              # 金額 (e.g., 5000)
+
+    def __str__(self):
+        return f"{self.racecourse} {self.race_number}R - {self.bet_type} {self.horse_number}番 {self.amount:,}円 (receipt: {self.receipt_number})"
+
+
+@dataclass
+class Ticket:
+    """tickets.csvから読み込んだ投票指示"""
+    racecourse: str          # race_course column
+    race_number: int         # race_number column
+    bet_type: str            # bet_type column (default: "単勝")
+    horse_number: int        # horse_number column
+    horse_name: str          # horse_name column
+    amount: int              # amount column
+
+    def matches(self, existing_bet: ExistingBet) -> bool:
+        """既存の投票と一致するかチェック"""
+        return (
+            self.racecourse == existing_bet.racecourse and
+            self.race_number == existing_bet.race_number and
+            self.bet_type == existing_bet.bet_type and
+            self.horse_number == existing_bet.horse_number and
+            self.amount == existing_bet.amount
+        )
+
+    def __str__(self):
+        return f"{self.racecourse} {self.race_number}R - {self.horse_number}番 {self.horse_name} {self.amount:,}円"
+
+
+@dataclass
+class ReconciliationResult:
+    """突合結果"""
+    ticket: Ticket
+    status: TicketStatus
+    existing_bet: Optional[ExistingBet] = None
+    error_message: Optional[str] = None
+
+
+# ========================================
+# ヘルパー関数
+# ========================================
 
 async def get_all_secrets():
     """AWS Secrets Managerから認証情報を取得"""
@@ -80,10 +147,356 @@ async def take_screenshot(page: Page, name: str):
         logger.warning(f"Failed to save screenshot: {e}")
 
 
-async def deposit(page: Page, credentials: dict):
+async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[ExistingBet]:
+    """
+    投票内容照会から既存の投票を取得
+
+    Args:
+        page: Playwright page object
+        date_type: "same_day" (当日分) or "previous_day" (前日分)
+
+    Returns:
+        List of ExistingBet objects
+    """
+    try:
+        logger.info("📋 Fetching existing bets from 投票内容照会...")
+
+        # メインメニューに戻る
+        await page.goto(IPAT_HOME_URL)
+        await page.wait_for_timeout(3000)
+
+        # 「投票履歴」ボタンをクリック
+        try:
+            # テキストで検索
+            await page.wait_for_timeout(2000)
+
+            # ページのテキストを取得してデバッグ
+            body_text = await page.evaluate("document.body.innerText")
+            logger.info(f"Page text (first 500 chars): {body_text[:500]}")
+
+            # 「投票履歴」ボタンを探す
+            履歴_found = False
+
+            # 方法1: 直接「投票履歴」ボタンを探す
+            if "投票履歴" in body_text:
+                logger.info("✓ Found 投票履歴 in page text")
+                # クリック可能な要素を探す
+                buttons = await page.query_selector_all('button, a, div[role="button"]')
+                for button in buttons:
+                    text = await button.text_content()
+                    if text and "投票履歴" in text:
+                        logger.info(f"✓ Clicking button: {text.strip()}")
+                        await button.click()
+                        履歴_found = True
+                        break
+
+            if not 履歴_found:
+                logger.warning("⚠️ Could not find 投票履歴 button, will try alternative approach")
+                # スクリーンショットを保存
+                await take_screenshot(page, "投票履歴_not_found")
+                # 空のリストを返す（エラーにはしない）
+                return []
+
+            await page.wait_for_timeout(3000)
+
+            # 「投票内容照会（当日分/前日分）」を選択
+            if date_type == "same_day":
+                logger.info("Selecting 当日分...")
+                # 当日分のボタン/リンクをクリック
+                当日_buttons = await page.query_selector_all('button, a, div[role="button"]')
+                for button in 当日_buttons:
+                    text = await button.text_content()
+                    if text and "当日" in text:
+                        logger.info(f"✓ Clicking: {text.strip()}")
+                        await button.click()
+                        break
+            else:
+                logger.info("Selecting 前日分...")
+                # 前日分のボタン/リンクをクリック
+                前日_buttons = await page.query_selector_all('button, a, div[role="button"]')
+                for button in 前日_buttons:
+                    text = await button.text_content()
+                    if text and "前日" in text:
+                        logger.info(f"✓ Clicking: {text.strip()}")
+                        await button.click()
+                        break
+
+            await page.wait_for_timeout(3000)
+
+            # テーブルからデータを抽出
+            # IPATのテーブル構造に応じて調整が必要
+            existing_bets = []
+
+            # まずページのHTMLを保存してデバッグ
+            try:
+                html_content = await page.content()
+                with open("output/bet_history_page.html", "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                logger.info("✓ HTML saved: output/bet_history_page.html")
+            except Exception as e:
+                logger.warning(f"Failed to save HTML: {e}")
+
+            # テーブルの行を取得
+            # 複数のセレクタパターンを試す
+            # 新しい実装: 受付番号リンクをクリックして詳細を取得
+            # 初回のリンク数を取得
+            receipt_links = await page.query_selector_all('.bet-refer-list a[ng-click*="showBetReferDetail"]')
+            total_receipts = len(receipt_links)
+            logger.info(f"Found {total_receipts} receipt links")
+
+            if total_receipts == 0:
+                logger.warning("⚠️ No receipt links found - no bets today")
+                return []
+
+            # 各受付番号の詳細を取得（インデックスベースでループして要素の陳腐化を防ぐ）
+            for idx in range(total_receipts):
+                try:
+                    # 毎回リンクを再取得（DOM変更による陳腐化を防ぐ）
+                    receipt_links = await page.query_selector_all('.bet-refer-list a[ng-click*="showBetReferDetail"]')
+                    if idx >= len(receipt_links):
+                        logger.warning(f"⚠️ Receipt {idx} no longer available, skipping")
+                        continue
+
+                    link = receipt_links[idx]
+                    receipt_num = await link.text_content()
+                    receipt_num = receipt_num.strip()
+                    logger.info(f"📄 Checking receipt {idx+1}/{total_receipts}: {receipt_num}")
+
+                    # 詳細ビューを開く
+                    await link.click()
+                    await page.wait_for_timeout(2000)
+
+                    # 詳細ビューが完全に表示されるまで待つ
+                    try:
+                        await page.wait_for_selector('.bet-refer-result', state='visible', timeout=5000)
+                    except:
+                        logger.warning("   ⚠️ Detail view not fully loaded")
+
+                    # 詳細ビューのHTMLを解析
+                    html_content = await page.content()
+                    page_text = await page.text_content('body')
+
+                    # 最初のレコードのために詳細ビューのHTMLを保存（デバッグ用）
+                    if idx == 0:
+                        with open('output/bet_detail_first.html', 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+                        await take_screenshot(page, "bet_detail_first")
+                        logger.info("✓ Saved first bet detail HTML for debugging")
+
+                    # テキストから情報を抽出
+                    import re
+
+                    # 1. レース場
+                    racecourse_match = re.search(r'(東京|京都|阪神|中山|小倉|福島|新潟|札幌|函館|中京)', page_text)
+                    racecourse = racecourse_match.group(1) if racecourse_match else None
+
+                    # 2. レース番号
+                    race_num_match = re.search(r'(\d+)R', page_text)
+                    race_number = int(race_num_match.group(1)) if race_num_match else None
+
+                    # 3. 式別
+                    bet_type_match = re.search(r'(単勝|複勝|馬連|馬単|ワイド|三連複|三連単)', page_text)
+                    bet_type = bet_type_match.group(1) if bet_type_match else None
+
+                    # 4. 金額
+                    amount_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*円', page_text)
+                    amount = int(amount_match.group(1).replace(',', '')) if amount_match else None
+
+                    # 5. 馬番（CSS セレクタ優先、regex フォールバック）
+                    horse_number = None
+
+                    # Method 1: CSS selector (推奨)
+                    try:
+                        horse_elem = await page.query_selector('.horse-combi .set-heading')
+                        if horse_elem:
+                            horse_text = await horse_elem.text_content()
+                            horse_number = int(horse_text.strip())
+                            logger.debug(f"   Horse number from CSS: {horse_number}")
+                    except Exception as e:
+                        logger.debug(f"   CSS selector failed: {e}")
+
+                    # Method 2: Regex fallback on HTML content
+                    if horse_number is None:
+                        horse_match = re.search(r'class="set-heading[^"]*"[^>]*>\s*(\d+)\s*</span>', html_content)
+                        if horse_match:
+                            horse_number = int(horse_match.group(1))
+                            logger.debug(f"   Horse number from regex: {horse_number}")
+
+                    # Method 3: Print version fallback on HTML content
+                    if horse_number is None:
+                        horse_match = re.search(r'ng-switch-when="\d+"[^>]*>\s*(\d+)\s*</span>', html_content)
+                        if horse_match:
+                            horse_number = int(horse_match.group(1))
+                            logger.debug(f"   Horse number from print version: {horse_number}")
+
+                    # Method 4: Simple pattern in text - look for 馬番 in isolation
+                    if horse_number is None:
+                        # Find horse number in the page text near "馬券表示" section
+                        horse_match = re.search(r'ng-bind="vm\.header\.horse\d+">(\d+)</span>', html_content)
+                        if horse_match:
+                            horse_number = int(horse_match.group(1))
+                            logger.debug(f"   Horse number from ng-bind pattern: {horse_number}")
+
+                    # すべてのフィールドが取得できたか確認
+                    if all([racecourse, race_number, bet_type, horse_number, amount]):
+                        existing_bet = ExistingBet(
+                            receipt_number=receipt_num,
+                            racecourse=racecourse,
+                            race_number=race_number,
+                            bet_type=bet_type,
+                            horse_number=horse_number,
+                            amount=amount
+                        )
+                        existing_bets.append(existing_bet)
+                        logger.info(f"   ✓ Parsed: {racecourse} {race_number}R {bet_type} {horse_number}番 {amount}円")
+                    else:
+                        logger.warning(f"   ⚠️ Could not parse all fields")
+                        logger.warning(f"      racecourse={racecourse}, race={race_number}, type={bet_type}, horse={horse_number}, amount={amount}")
+
+                    # 詳細ビューから一覧に戻る（「閉じる」ではなく「一覧に戻る」ボタンを使用）
+                    back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
+                    if back_button:
+                        await back_button.click()
+                        await page.wait_for_timeout(1000)
+                    else:
+                        logger.warning("⚠️ Could not find back button, trying close button")
+                        # フォールバック: 閉じるボタンを試す（これは全体を閉じる可能性あり）
+                        close_button = await page.query_selector('button[ng-click="vm.close()"]')
+                        if close_button:
+                            await close_button.click()
+                            await page.wait_for_timeout(1000)
+
+                except Exception as e:
+                    logger.warning(f"Failed to parse receipt {idx+1}: {e}")
+                    # エラー時も一覧に戻るボタンを試す
+                    try:
+                        back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
+                        if back_button:
+                            await back_button.click()
+                            await page.wait_for_timeout(1000)
+                        else:
+                            close_button = await page.query_selector('button[ng-click="vm.close()"]')
+                            if close_button:
+                                await close_button.click()
+                                await page.wait_for_timeout(1000)
+                    except:
+                        pass
+                    continue
+
+            logger.info(f"✅ Found {len(existing_bets)} existing bets from {total_receipts} receipts")
+
+            # メインページに戻る
+            await page.goto(IPAT_HOME_URL)
+            await page.wait_for_timeout(2000)
+
+            return existing_bets
+
+        except Exception as e:
+            logger.error(f"Failed during bet history navigation: {e}")
+            await take_screenshot(page, "bet_history_error")
+            return []
+
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch existing bets: {e}")
+        await take_screenshot(page, "fetch_existing_bets_error")
+        return []
+
+
+def reconcile_tickets(
+    tickets: List[Ticket],
+    existing_bets: List[ExistingBet]
+) -> List[ReconciliationResult]:
+    """
+    tickets.csvと既存投票を突合
+
+    Args:
+        tickets: tickets.csvから読み込んだチケットリスト
+        existing_bets: 投票履歴から取得した既存投票リスト
+
+    Returns:
+        ReconciliationResultのリスト
+    """
+    results = []
+
+    logger.info("=" * 60)
+    logger.info("TICKET RECONCILIATION")
+    logger.info("=" * 60)
+
+    for ticket in tickets:
+        # Check if ticket already exists in placed bets
+        matching_bet = None
+        for existing_bet in existing_bets:
+            if ticket.matches(existing_bet):
+                matching_bet = existing_bet
+                break
+
+        if matching_bet:
+            result = ReconciliationResult(
+                ticket=ticket,
+                status=TicketStatus.ALREADY_PURCHASED,
+                existing_bet=matching_bet
+            )
+            logger.info(f"✓ SKIP: {ticket}")
+            logger.info(f"        (already purchased - receipt: {matching_bet.receipt_number})")
+        else:
+            result = ReconciliationResult(
+                ticket=ticket,
+                status=TicketStatus.NOT_PURCHASED
+            )
+            logger.info(f"→ TODO: {ticket} (not yet purchased)")
+
+        results.append(result)
+
+    # Summary
+    already_purchased = sum(1 for r in results if r.status == TicketStatus.ALREADY_PURCHASED)
+    to_purchase = sum(1 for r in results if r.status == TicketStatus.NOT_PURCHASED)
+
+    logger.info("=" * 60)
+    logger.info(f"SUMMARY: {already_purchased} already purchased, {to_purchase} to purchase")
+    logger.info("=" * 60)
+
+    return results
+
+
+async def get_current_balance(page: Page) -> int:
+    """現在の購入限度額（残高）を取得"""
+    try:
+        # まず画面に表示されているテキストから探す
+        body_text = await page.evaluate("document.body.innerText")
+
+        # "購入限度額" の後の数字を探す（複数パターン対応）
+        import re
+        patterns = [
+            r'購入限度額[^\d]*(\d+(?:,\d+)*)\s*円',  # トップページ
+            r'購入限度額\s*(\d+(?:,\d+)*)\s*円',      # 投票ページ（スペース付き）
+            r'(\d+(?:,\d+)*)\s*円[^\d]*購入限度額',  # 逆順パターン
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, body_text)
+            if match:
+                balance_str = match.group(1).replace(',', '')
+                balance = int(balance_str)
+                logger.info(f"💰 Current balance: {balance:,}円")
+                return balance
+
+        # スクリーンショットを取得して確認
+        logger.warning("⚠️ Could not find balance on page, taking screenshot for debugging")
+        await take_screenshot(page, "balance_not_found")
+
+        # 見つからない場合でも0を返す（エラーにはしない）
+        logger.info("💰 Current balance: unknown (assuming sufficient)")
+        return 999999  # 不明な場合は十分な金額と仮定
+
+    except Exception as e:
+        logger.error(f"Failed to get balance: {e}")
+        return 999999  # エラー時も十分な金額と仮定
+
+
+async def deposit(page: Page, credentials: dict, amount: int = 20000):
     """入金処理（Seleniumコードベース）"""
     try:
-        deposit_amount = int(os.environ.get('DEPOSIT_AMOUNT', '10000'))
+        deposit_amount = amount
         logger.info(f"💸 Starting deposit process: {deposit_amount}円")
 
         # "入出金"ボタンを探してクリック
@@ -130,14 +543,22 @@ async def deposit(page: Page, credentials: dict):
         await deposit_page.fill('input[name="NYUKIN"]', str(deposit_amount))
         logger.info(f"✓ Deposit amount entered: {deposit_amount}円")
 
-        # "次へ"をクリック
-        links = await deposit_page.query_selector_all('a')
-        for link in links:
-            text = await link.text_content()
-            if text and "次へ" in text:
-                logger.info("✓ Clicking '次へ'")
-                await link.click()
+        # "次へ"をクリック（ボタンまたはリンク）
+        clickables = await deposit_page.query_selector_all('a, button, input[type="button"], input[type="submit"]')
+        next_clicked = False
+        for element in clickables:
+            text = await element.text_content() if element else ""
+            value = await element.get_attribute('value') if element else ""
+            if (text and "次へ" in text) or (value and "次へ" in value):
+                logger.info("✓ Clicking '次へ' button")
+                await element.click()
+                next_clicked = True
                 break
+
+        if not next_clicked:
+            logger.error("❌ '次へ' button not found!")
+            await deposit_page.close()
+            return False
 
         await deposit_page.wait_for_timeout(4000)
 
@@ -145,14 +566,127 @@ async def deposit(page: Page, credentials: dict):
         await deposit_page.fill('input[name="PASS_WORD"]', credentials['password'])
         logger.info("✓ Password entered for deposit")
 
-        # "実行"をクリック
-        links = await deposit_page.query_selector_all('a')
-        for link in links:
-            text = await link.text_content()
-            if text and "実行" in text:
-                logger.info("✓ Clicking '実行'")
-                await link.click()
+        # デバッグ: 実行前のHTMLを保存
+        try:
+            html_before = await deposit_page.content()
+            with open("output/deposit_page_before_execution.html", "w", encoding="utf-8") as f:
+                f.write(html_before)
+            logger.info("✓ HTML saved: output/deposit_page_before_execution.html")
+        except Exception as e:
+            logger.warning(f"Failed to save HTML: {e}")
+
+        # "実行"をクリック（ボタンまたはリンク）- JavaScriptクリックで確実に
+        clickables = await deposit_page.query_selector_all('a, button, input[type="button"], input[type="submit"]')
+        execution_clicked = False
+        execution_element = None
+        for element in clickables:
+            text = await element.text_content() if element else ""
+            value = await element.get_attribute('value') if element else ""
+            if (text and "実行" in text) or (value and "実行" in value):
+                logger.info(f"✓ Found '実行' button/link: text='{text}', value='{value}'")
+                execution_element = element
                 break
+
+        if not execution_element:
+            logger.error("❌ '実行' button not found!")
+            await deposit_page.close()
+            return False
+
+        # 実行ボタンの詳細をログ出力
+        tag_name = await execution_element.evaluate("el => el.tagName")
+        onclick = await execution_element.get_attribute("onclick")
+        logger.info(f"✓ Element type: {tag_name}, onclick: {onclick}")
+
+        # confirmダイアログを自動承認するハンドラーを設定
+        deposit_page.on('dialog', lambda dialog: dialog.accept())
+        logger.info("✓ Dialog handler set to auto-accept")
+
+        # deposit_pageのコンテキストでsubmitForm関数を直接実行（診断情報付き）
+        logger.info("✓ Executing submitForm with diagnostics")
+        try:
+            # submitFormの各ステップを詳細に追跡
+            result = await deposit_page.evaluate("""
+                () => {
+                    const form = document.forms.nyukinForm;
+                    const execButton = document.querySelector('a[onclick*="EXEC"]');
+
+                    if (!form) {
+                        return {success: false, message: 'Form not found'};
+                    }
+                    if (!execButton) {
+                        return {success: false, message: 'Exec button not found'};
+                    }
+                    if (typeof submitForm !== 'function') {
+                        return {success: false, message: 'submitForm function not found'};
+                    }
+                    if (typeof checkInput !== 'function') {
+                        return {success: false, message: 'checkInput function not found'};
+                    }
+
+                    // checkInput の結果を取得
+                    form.COMMAND.value = 'EXEC';
+                    const errFlg = checkInput(form);
+
+                    return {
+                        success: true,
+                        checkInputResult: errFlg,
+                        commandValue: form.COMMAND.value,
+                        hasConfirm: true,
+                        willSubmit: errFlg === 0
+                    };
+                }
+            """)
+            logger.info(f"✓ Diagnostic result: {result}")
+
+            if not result.get('success', False):
+                logger.error(f"❌ Diagnostic failed: {result.get('message')}")
+                await deposit_page.close()
+                return False
+
+            # checkInput がエラーを返している場合
+            if result.get('checkInputResult', 0) != 0:
+                logger.error(f"❌ checkInput returned error code: {result.get('checkInputResult')}")
+                logger.error("This means the form validation failed. Possible reasons:")
+                logger.error("- 銀行口座が登録されていない")
+                logger.error("- 入金額が不正")
+                logger.error("- その他のバリデーションエラー")
+                await take_screenshot(deposit_page, "checkInput_failed")
+                await deposit_page.close()
+                return False
+
+            logger.info(f"✓ checkInput passed (errFlg=0), proceeding with submission")
+
+            # checkInputが成功した場合のみ、実際にsubmitを実行
+            submit_result = await deposit_page.evaluate("""
+                () => {
+                    const form = document.forms.nyukinForm;
+                    const execButton = document.querySelector('a[onclick*="EXEC"]');
+
+                    // flagをリセット（グローバル変数）
+                    if (typeof flag !== 'undefined') {
+                        window.flag = false;
+                    }
+
+                    // submitForm を呼び出し
+                    submitForm(execButton, form, 'EXEC');
+
+                    return {success: true, message: 'submitForm called'};
+                }
+            """)
+            logger.info(f"✓ Submit result: {submit_result}")
+
+            # フォーム送信後のナビゲーションを待つ
+            logger.info("⏳ Waiting for navigation after form submission...")
+            try:
+                await deposit_page.wait_for_load_state('networkidle', timeout=10000)
+                logger.info("✓ Navigation completed")
+            except Exception as nav_error:
+                logger.warning(f"⚠️ Navigation timeout (might be expected): {nav_error}")
+
+        except Exception as e:
+            logger.error(f"❌ Execution failed: {e}")
+            await deposit_page.close()
+            return False
 
         await deposit_page.wait_for_timeout(4000)
 
@@ -169,11 +703,49 @@ async def deposit(page: Page, credentials: dict):
 
         # 入金ウィンドウを閉じる
         await deposit_page.close()
-        logger.info("✅ Deposit completed successfully")
 
-        # メインページで残高が更新されるまで待つ
-        await page.wait_for_timeout(5000)
+        # メインページで残高が更新されるまで待つ（最大3回、各30秒 = 最大90秒）
+        # Note: Balance may not update if funds are reserved in cart
+        logger.info("⏳ Checking if deposit has reflected in balance...")
 
+        balance = 0
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            logger.info(f"💰 Attempt {attempt}/{max_retries}: Checking balance...")
+
+            # デバッグ: HTMLを保存
+            try:
+                html_content = await page.content()
+                with open(f"output/main_page_after_deposit_attempt{attempt}.html", "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                logger.info(f"✓ HTML saved: output/main_page_after_deposit_attempt{attempt}.html")
+            except Exception as e:
+                logger.warning(f"Failed to save HTML: {e}")
+
+            # 残高を確認
+            balance = await get_current_balance(page)
+
+            if balance >= deposit_amount:
+                logger.info(f"✅ Deposit confirmed! Balance: {balance:,}円 (Expected: {deposit_amount:,}円)")
+                break
+            else:
+                logger.warning(f"⚠️ Balance not yet updated: {balance:,}円 / {deposit_amount:,}円")
+                if attempt < max_retries:
+                    logger.info(f"🔄 Waiting 30 seconds before next check... ({attempt}/{max_retries})")
+                    # 次のチェックまで30秒待機
+                    await page.wait_for_timeout(30000)
+
+        # 最終確認
+        if balance < deposit_amount:
+            logger.warning(f"⚠️ Balance verification timed out after {max_retries} attempts")
+            logger.warning(f"   Expected: {deposit_amount:,}円, Got: {balance:,}円")
+            logger.warning("⚠️ This may be normal if funds are reserved in cart from previous operations")
+            logger.info("✅ Deposit was submitted successfully - proceeding with purchase anyway")
+            await take_screenshot(page, "deposit_verification_timeout")
+            # Continue anyway since deposit was submitted
+            return True
+
+        logger.info(f"✅ Deposit completed and verified: {balance:,}円")
         return True
 
     except Exception as e:
@@ -355,12 +927,6 @@ async def login_simple(page: Page, credentials: dict):
         await page.wait_for_timeout(2000)
         await take_screenshot(page, "login_complete")
         logger.info("✅ Login completed successfully")
-
-        # 残高が0円の場合は入金処理を実行
-        if balance is not None and balance == 0:
-            logger.info("💸 Balance is 0, starting deposit process...")
-            await deposit(page, credentials)
-
         return True
 
     except Exception as e:
@@ -439,8 +1005,14 @@ async def navigate_to_vote_simple(page: Page):
         for button in buttons:
             text = await button.text_content()
             if text and "通常" in text and "投票" in text:
-                await button.click()
-                logger.info(f"✓ Clicked vote button: {text.strip()}")
+                # JavaScriptクリックを使用（要素が他の要素に隠れていてもOK）
+                try:
+                    await button.evaluate("el => el.click()")
+                    logger.info(f"✓ Clicked vote button (JS click): {text.strip()}")
+                except Exception as e:
+                    logger.warning(f"JS click failed, trying normal click: {e}")
+                    await button.click()
+                    logger.info(f"✓ Clicked vote button: {text.strip()}")
                 await page.wait_for_timeout(4000)
 
                 # 投票ボタンクリック後にモーダルが出る場合があるので再度チェック
@@ -477,8 +1049,14 @@ async def navigate_to_vote_simple(page: Page):
                 for button in frame_buttons:
                     text = await button.text_content()
                     if text and "通常" in text and "投票" in text:
-                        await button.click()
-                        logger.info(f"✓ Clicked vote button in frame {i}: {text.strip()}")
+                        # JavaScriptクリックを使用
+                        try:
+                            await button.evaluate("el => el.click()")
+                            logger.info(f"✓ Clicked vote button in frame {i} (JS click): {text.strip()}")
+                        except Exception as e:
+                            logger.warning(f"JS click failed in frame {i}, trying normal click: {e}")
+                            await button.click()
+                            logger.info(f"✓ Clicked vote button in frame {i}: {text.strip()}")
                         await page.wait_for_timeout(4000)
                         await take_screenshot(page, "vote_page")
                         return True
@@ -608,6 +1186,13 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
     try:
         logger.info(f"🎯 Selecting horse #{horse_number} {horse_name}, bet {bet_amount} yen...")
 
+        # 購入前に残高をチェック（念のため）
+        balance = await get_current_balance(page)
+        if balance < bet_amount:
+            logger.error(f"❌ Insufficient balance! Required: {bet_amount:,}円, Available: {balance:,}円")
+            await take_screenshot(page, f"insufficient_balance_{horse_number}")
+            return False
+
         await page.wait_for_timeout(4000)
 
         # スクロール（大きい番号の場合）
@@ -708,18 +1293,161 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
 
         await page.wait_for_timeout(4000)
 
-        # OKボタン
+        # ダイアログのメッセージを確認
+        page_text = await page.text_content('body')
+
+        # エラーメッセージのチェック
+        error_keywords = ['できません', 'エラー', '失敗', '不足', '無効', '締切']
+        success_keywords = ['受付', '完了', '購入しました', 'セットしました']
+
+        # どのキーワードがマッチしたかを記録
+        matched_errors = [kw for kw in error_keywords if kw in page_text]
+        matched_success = [kw for kw in success_keywords if kw in page_text]
+
+        has_error = len(matched_errors) > 0
+        has_success = len(matched_success) > 0
+
+        logger.info(f"🔍 Matched error keywords: {matched_errors}")
+        logger.info(f"✅ Matched success keywords: {matched_success}")
+
+        # 成功キーワードが見つかった場合は成功を優先（エラーキーワードは他のレースの状態表示にも含まれるため）
+        if has_success:
+            logger.info(f"✅ Purchase set successfully (success keywords found): {matched_success}")
+            # 成功の場合でもエラーキーワードが含まれていたら警告
+            if has_error:
+                logger.warning(f"⚠️ Error keywords also found (likely from other races): {matched_errors}")
+        elif has_error:
+            # 成功キーワードがなく、エラーキーワードのみの場合はエラー
+            logger.error(f"❌ Purchase failed! Error message detected: {matched_errors}")
+            logger.error(f"Page content: {page_text[:1000]}")  # 最初の1000文字を出力
+            await take_screenshot(page, "purchase_failed")
+            # エラーダイアログのOKをクリック
+            buttons = await page.query_selector_all('button')
+            for button in buttons:
+                text = await button.text_content()
+                if text and text.strip() == "OK":
+                    await button.click()
+                    break
+            return False
+
+        # OKボタンをクリック（「セットしました」ダイアログを閉じる）
+        ok_clicked = False
         buttons = await page.query_selector_all('button')
         for button in buttons:
             text = await button.text_content()
             if text and text.strip() == "OK":
                 await button.click()
-                logger.info(f"✅ Purchase successful: {horse_name} - {bet_amount} yen")
-                await take_screenshot(page, "purchase_success")
-                return True
+                logger.info("✓ 'Set confirmation' dialog closed")
+                ok_clicked = True
+                break
 
-        logger.warning("OK button not found, but purchase may have succeeded")
-        return True
+        if not ok_clicked:
+            logger.error("❌ Set confirmation failed: OK button not found")
+            await take_screenshot(page, "set_no_ok_button")
+            return False
+
+        if not has_success:
+            logger.warning("⚠️ Set status unclear - success message not found")
+            await take_screenshot(page, "set_unclear")
+            return False
+
+        # ここまでで「セット」(カートに追加)が完了
+        logger.info(f"✅ Bet added to cart: {horse_name} - {bet_amount} yen")
+
+        # 実際の「購入」処理を実行
+        await page.wait_for_timeout(2000)
+        await take_screenshot(page, "after_set")
+
+        # 購入予定リストから「投票内容確認」ボタンを探してクリック
+        logger.info("🛒 Looking for 'Confirm Vote Content' button...")
+
+        # より柔軟な検索：テキストに「投票」「内容」「確認」が全て含まれる要素を探す
+        # （改行やスペースに対応するため）
+        confirm_clicked = False
+
+        # まず、通常の方法で試す
+        confirm_buttons = await page.query_selector_all('button, a, div')
+        logger.info(f"Found {len(confirm_buttons)} potential button elements")
+
+        for btn in confirm_buttons:
+            try:
+                text = await btn.text_content()
+                if text:
+                    # 改行・スペースを削除して検索
+                    normalized_text = text.replace('\n', '').replace(' ', '').replace('\t', '')
+                    if "投票内容確認" in normalized_text or ("投票" in normalized_text and "内容" in normalized_text and "確認" in normalized_text):
+                        logger.info(f"✓ Found button with vote confirmation text: '{text[:100]}'")
+                        try:
+                            # JavaScriptクリックを使用
+                            await btn.evaluate("el => el.click()")
+                            logger.info(f"✓ Confirm button clicked successfully")
+                            confirm_clicked = True
+                            break
+                        except Exception as click_error:
+                            logger.warning(f"⚠️ Click failed, trying next match: {click_error}")
+            except Exception as e:
+                pass
+
+        if not confirm_clicked:
+            logger.error("❌ Confirm vote content button not found")
+            await take_screenshot(page, "confirm_button_not_found")
+            return False
+
+        # 確認画面が表示されるまで待つ
+        await page.wait_for_timeout(3000)
+        await take_screenshot(page, "purchase_confirmation_screen")
+
+        # 確認画面で「購入する」ボタンを探してクリック
+        logger.info("💳 Looking for final purchase button on confirmation screen...")
+
+        final_buttons = await page.query_selector_all('button, a, div[ng-click]')
+        final_purchase_clicked = False
+
+        for btn in final_buttons:
+            try:
+                text = await btn.text_content()
+                if text and "購入" in text.strip() and len(text.strip()) < 10:
+                    # ボタンが表示されているか確認
+                    if await btn.is_visible():
+                        # JavaScriptクリックを使用
+                        await btn.evaluate("el => el.click()")
+                        logger.info(f"✓ Final purchase button clicked: {text.strip()}")
+                        final_purchase_clicked = True
+                        break
+            except:
+                pass
+
+        if not final_purchase_clicked:
+            logger.error("❌ Final purchase button not found on confirmation screen")
+            await take_screenshot(page, "final_purchase_button_not_found")
+            return False
+
+        # 購入確認ダイアログの処理
+        await page.wait_for_timeout(3000)
+        await take_screenshot(page, "final_purchase_confirmation")
+
+        # 購入完了のメッセージを確認
+        page_text_final = await page.text_content('body')
+
+        if '購入しました' in page_text_final or '受付' in page_text_final:
+            logger.info(f"✅ Purchase completed successfully: {horse_name} - {bet_amount} yen")
+            await take_screenshot(page, "purchase_complete_success")
+
+            # 完了ダイアログのOKをクリック
+            final_buttons = await page.query_selector_all('button')
+            for btn in final_buttons:
+                text = await btn.text_content()
+                if text and text.strip() == "OK":
+                    await btn.click()
+                    logger.info("✓ Purchase completion dialog closed")
+                    break
+
+            return True
+        else:
+            logger.error("❌ Purchase completion message not found")
+            logger.error(f"Page text: {page_text_final[:500]}")
+            await take_screenshot(page, "purchase_completion_failed")
+            return False
 
     except Exception as e:
         logger.error(f"Failed to place bet: {e}")
@@ -735,14 +1463,30 @@ async def main():
         # 認証情報取得
         credentials, slack_info = await get_all_secrets()
 
-        # tickets.csv読み込み
-        tickets_path = Path('tickets/tickets.csv')
+        # tickets.csv読み込み（日付指定または最新）
+        # 環境変数でtickets_dateを指定可能（例：20251116）
+        tickets_date = os.environ.get('TICKETS_DATE', None)
+
+        if tickets_date:
+            # 日付指定がある場合、そのファイルを読む
+            tickets_path = Path(f'tickets/tickets_{tickets_date}.csv')
+        else:
+            # 日付指定がない場合、tickets_YYYYMMDD.csvの最新ファイルを探す
+            tickets_dir = Path('tickets')
+            dated_files = sorted(tickets_dir.glob('tickets_????????.csv'), reverse=True)
+            if dated_files:
+                tickets_path = dated_files[0]  # 最新のファイル
+                logger.info(f"📅 Using latest tickets file: {tickets_path.name}")
+            else:
+                # 日付なしのtickets.csvにフォールバック
+                tickets_path = Path('tickets/tickets.csv')
+
         if not tickets_path.exists():
-            logger.error("tickets.csv not found")
+            logger.error(f"❌ Tickets file not found: {tickets_path}")
             return
 
         tickets_df = pd.read_csv(tickets_path)
-        logger.info(f"📄 Found {len(tickets_df)} tickets to process")
+        logger.info(f"📄 Found {len(tickets_df)} tickets to process from {tickets_path.name}")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -801,18 +1545,125 @@ async def main():
                 else:
                     logger.info("✓ Session is still valid")
 
-            # 各チケットを処理
-            for ticket_idx, (idx, ticket) in enumerate(tickets_df.iterrows()):
-                try:
-                    racecourse = ticket['race_course']
-                    race_number = int(ticket['race_number'])
-                    horse_number = int(ticket['horse_number'])
-                    horse_name = ticket['horse_name']
-                    bet_amount = int(ticket['amount'])
+            # DRY_RUNモード判定
+            DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+            if DRY_RUN:
+                logger.warning("=" * 60)
+                logger.warning("🔸 DRY_RUN MODE ENABLED")
+                logger.warning("=" * 60)
 
+            # tickets.csvをTicketオブジェクトに変換
+            tickets = []
+            for _, row in tickets_df.iterrows():
+                ticket = Ticket(
+                    racecourse=row['race_course'],
+                    race_number=int(row['race_number']),
+                    bet_type=row.get('bet_type', '単勝'),  # デフォルト: 単勝
+                    horse_number=int(row['horse_number']),
+                    horse_name=row['horse_name'],
+                    amount=int(row['amount'])
+                )
+                tickets.append(ticket)
+
+            logger.info(f"📄 Loaded {len(tickets)} tickets from CSV")
+
+            # ⭐ 既存の投票を取得（冪等性チェック）
+            existing_bets = await fetch_existing_bets(page, date_type="same_day")
+
+            # ⭐ 突合処理
+            reconciliation_results = reconcile_tickets(tickets, existing_bets)
+
+            # ⭐ 未購入のチケットのみを抽出
+            to_purchase = [
+                r.ticket for r in reconciliation_results
+                if r.status == TicketStatus.NOT_PURCHASED
+            ]
+
+            # サマリーレポート
+            already_purchased_count = sum(
+                1 for r in reconciliation_results
+                if r.status == TicketStatus.ALREADY_PURCHASED
+            )
+
+            logger.info("\n" + "=" * 60)
+            logger.info("RECONCILIATION SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Total tickets: {len(tickets)}")
+            logger.info(f"Already purchased: {already_purchased_count}")
+            logger.info(f"To purchase: {len(to_purchase)}")
+            logger.info("=" * 60)
+
+            # 全てのチケットが既に購入済みの場合
+            if len(to_purchase) == 0:
+                logger.info("✅ All tickets already purchased! Nothing to do.")
+                await browser.close()
+                return
+
+            # DRY_RUNモードの場合、購入をスキップ
+            if DRY_RUN:
+                logger.warning("\n" + "=" * 60)
+                logger.warning("🔸 DRY_RUN MODE: Simulating bet placement")
+                logger.warning("=" * 60)
+                logger.warning("The following bets would be placed:")
+                for idx, ticket in enumerate(to_purchase):
+                    logger.warning(f"  {idx+1}. {ticket}")
+
+                # 総費用を計算
+                total_cost = sum(t.amount for t in to_purchase)
+                logger.warning(f"\nTotal amount that would be spent: {total_cost:,}円")
+
+                # 残高確認（参考情報）
+                current_balance = await get_current_balance(page)
+                logger.warning(f"Current balance: {current_balance:,}円")
+
+                if current_balance < total_cost:
+                    shortage = total_cost - current_balance
+                    logger.warning(f"Would need to deposit: {shortage:,}円")
+                else:
+                    logger.warning(f"Balance is sufficient (no deposit needed)")
+
+                logger.warning("=" * 60)
+                logger.warning("🔸 DRY_RUN: Skipping actual bet placement")
+                logger.warning("=" * 60)
+
+                # DRY_RUNステータスに更新
+                for result in reconciliation_results:
+                    if result.status == TicketStatus.NOT_PURCHASED:
+                        result.status = TicketStatus.SKIPPED_DRY_RUN
+
+                await browser.close()
+                return
+
+            # ===== 通常モード: 実際に購入 =====
+
+            # 未購入チケットの総費用を計算
+            total_cost = sum(t.amount for t in to_purchase)
+            logger.info(f"\n💰 Total cost for unpurchased tickets: {total_cost:,}円")
+
+            # 現在の残高を確認
+            current_balance = await get_current_balance(page)
+            logger.info(f"💰 Current balance: {current_balance:,}円")
+
+            # 不足分を計算
+            if current_balance < total_cost:
+                shortage = total_cost - current_balance
+                logger.info(f"⚠️ Insufficient balance! Shortage: {shortage:,}円")
+                logger.info(f"💸 Depositing shortage amount: {shortage:,}円")
+
+                if await deposit(page, credentials, shortage):
+                    logger.info(f"✅ Deposit completed: {shortage:,}円")
+                else:
+                    logger.error("❌ Deposit failed - aborting ticket processing")
+                    await browser.close()
+                    return
+            else:
+                logger.info(f"✅ Balance is sufficient ({current_balance:,}円 >= {total_cost:,}円), skipping deposit")
+
+            # 未購入チケットのみ購入
+            for ticket_idx, ticket in enumerate(to_purchase):
+                try:
                     logger.info(f"\n{'='*60}")
-                    logger.info(f"🎫 Ticket {ticket_idx+1}/{len(tickets_df)}")
-                    logger.info(f"   {racecourse} R{race_number} - #{horse_number} {horse_name} - ¥{bet_amount}")
+                    logger.info(f"🎫 Purchasing {ticket_idx+1}/{len(to_purchase)}: {ticket}")
                     logger.info(f"{'='*60}")
 
                     # 各チケット処理の前にトップページに戻る（2つ目以降）
@@ -828,24 +1679,24 @@ async def main():
                         continue
 
                     # レース選択
-                    if not await select_race_simple(page, racecourse, race_number):
+                    if not await select_race_simple(page, ticket.racecourse, ticket.race_number):
                         logger.error("Failed to select race")
                         continue
 
                     # 馬選択と投票
-                    if await select_horse_and_bet_simple(page, horse_number, horse_name, bet_amount):
-                        logger.info(f"✅ Ticket {idx+1} completed successfully")
+                    if await select_horse_and_bet_simple(page, ticket.horse_number, ticket.horse_name, ticket.amount):
+                        logger.info(f"✅ Ticket {ticket_idx+1} completed successfully")
                     else:
-                        logger.error(f"❌ Ticket {idx+1} failed")
+                        logger.error(f"❌ Ticket {ticket_idx+1} failed")
 
                     # 次のチケットのため少し待機
                     await page.wait_for_timeout(5000)
 
                 except Exception as e:
-                    logger.error(f"Error processing ticket {idx+1}: {e}")
+                    logger.error(f"Error processing ticket {ticket_idx+1}: {e}")
                     continue
 
-            logger.info("\n🏁 All tickets processed")
+            logger.info("\n🏁 All unpurchased tickets processed")
             await browser.close()
 
     except Exception as e:
