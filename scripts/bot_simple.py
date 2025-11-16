@@ -501,15 +501,16 @@ async def get_current_balance(page: Page) -> int:
         return 999999  # エラー時も十分な金額と仮定
 
 
-async def deposit(page: Page, credentials: dict, amount: int = 20000):
-    """入金処理（Seleniumコードベース）"""
-    try:
-        deposit_amount = amount
-        logger.info(f"💸 Starting deposit process: {deposit_amount}円")
+async def open_deposit_window(page: Page) -> Optional[Page]:
+    """
+    入出金ポップアップウィンドウを開く
 
+    Returns:
+        入金ページ（失敗時はNone）
+    """
+    try:
         # "入出金"ボタンを探してクリック
         buttons = await page.query_selector_all('button')
-        found_deposit_button = False
         for button in buttons:
             text = await button.text_content()
             if text and "入出金" in text:
@@ -519,34 +520,53 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
                 async with page.expect_popup() as popup_info:
                     await button.click()
                 deposit_page = await popup_info.value
-                found_deposit_button = True
-                break
 
-        if not found_deposit_button:
-            logger.error("❌ '入出金' button not found")
-            return False
+                await deposit_page.wait_for_timeout(Timeouts.LONG)
+                logger.info(f"✓ Deposit window opened: {deposit_page.url}")
+                return deposit_page
 
-        await deposit_page.wait_for_timeout(Timeouts.LONG)
-        logger.info(f"✓ Deposit window opened: {deposit_page.url}")
+        logger.error("❌ '入出金' button not found")
+        return None
 
+    except Exception as e:
+        logger.error(f"❌ Failed to open deposit window: {e}")
+        return None
+
+
+async def navigate_to_deposit_form(deposit_page: Page) -> bool:
+    """
+    入金指示フォームへ遷移
+
+    Returns:
+        成功したらTrue
+    """
+    try:
         # "入金指示"リンクをクリック
         links = await deposit_page.query_selector_all('a')
-        found_deposit_link = False
         for link in links:
             text = await link.text_content()
             if text and "入金指示" in text:
                 logger.info("✓ Found '入金指示' link")
                 await link.click()
-                found_deposit_link = True
-                break
+                await deposit_page.wait_for_timeout(Timeouts.LONG)
+                return True
 
-        if not found_deposit_link:
-            logger.error("❌ '入金指示' link not found")
-            await deposit_page.close()
-            return False
+        logger.error("❌ '入金指示' link not found")
+        return False
 
-        await deposit_page.wait_for_timeout(Timeouts.LONG)
+    except Exception as e:
+        logger.error(f"❌ Failed to navigate to deposit form: {e}")
+        return False
 
+
+async def complete_and_submit_deposit(deposit_page: Page, credentials: dict, deposit_amount: int) -> bool:
+    """
+    入金フォームの入力と送信を完了
+
+    Returns:
+        成功したらTrue
+    """
+    try:
         # 金額を入力
         await deposit_page.fill('input[name="NYUKIN"]', str(deposit_amount))
         logger.info(f"✓ Deposit amount entered: {deposit_amount}円")
@@ -565,7 +585,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
         if not next_clicked:
             logger.error("❌ '次へ' button not found!")
-            await deposit_page.close()
             return False
 
         await deposit_page.wait_for_timeout(Timeouts.LONG)
@@ -585,7 +604,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
         # "実行"をクリック（ボタンまたはリンク）- JavaScriptクリックで確実に
         clickables = await deposit_page.query_selector_all('a, button, input[type="button"], input[type="submit"]')
-        execution_clicked = False
         execution_element = None
         for element in clickables:
             text = await element.text_content() if element else ""
@@ -597,7 +615,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
         if not execution_element:
             logger.error("❌ '実行' button not found!")
-            await deposit_page.close()
             return False
 
         # 実行ボタンの詳細をログ出力
@@ -648,7 +665,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
             if not result.get('success', False):
                 logger.error(f"❌ Diagnostic failed: {result.get('message')}")
-                await deposit_page.close()
                 return False
 
             # checkInput がエラーを返している場合
@@ -659,7 +675,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
                 logger.error("- 入金額が不正")
                 logger.error("- その他のバリデーションエラー")
                 await take_screenshot(deposit_page, "checkInput_failed")
-                await deposit_page.close()
                 return False
 
             logger.info(f"✓ checkInput passed (errFlg=0), proceeding with submission")
@@ -693,7 +708,6 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
         except Exception as e:
             logger.error(f"❌ Execution failed: {e}")
-            await deposit_page.close()
             return False
 
         await deposit_page.wait_for_timeout(Timeouts.LONG)
@@ -709,9 +723,25 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
         await deposit_page.wait_for_timeout(Timeouts.LONG)
         await take_screenshot(deposit_page, "deposit_complete")
 
-        # 入金ウィンドウを閉じる
-        await deposit_page.close()
+        return True
 
+    except Exception as e:
+        logger.error(f"❌ Failed to complete and submit deposit: {e}")
+        return False
+
+
+async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
+    """
+    入金が残高に反映されたか確認
+
+    Args:
+        page: メインページ
+        deposit_amount: 入金額
+
+    Returns:
+        残高確認成功したらTrue（タイムアウトでもTrueを返す）
+    """
+    try:
         # メインページで残高が更新されるまで待つ（最大3回、各30秒 = 最大90秒）
         # Note: Balance may not update if funds are reserved in cart
         logger.info("⏳ Checking if deposit has reflected in balance...")
@@ -735,7 +765,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
             if balance >= deposit_amount:
                 logger.info(f"✅ Deposit confirmed! Balance: {balance:,}円 (Expected: {deposit_amount:,}円)")
-                break
+                return True
             else:
                 logger.warning(f"⚠️ Balance not yet updated: {balance:,}円 / {deposit_amount:,}円")
                 if attempt < max_retries:
@@ -755,6 +785,50 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
         logger.info(f"✅ Deposit completed and verified: {balance:,}円")
         return True
+
+    except Exception as e:
+        logger.error(f"❌ Failed to verify deposit balance: {e}")
+        await take_screenshot(page, "deposit_verification_error")
+        # Return True anyway to continue with purchase
+        return True
+
+
+async def deposit(page: Page, credentials: dict, amount: int = 20000):
+    """
+    入金処理（Seleniumコードベース）
+
+    Args:
+        page: メインページ
+        credentials: 認証情報
+        amount: 入金額
+
+    Returns:
+        成功したらTrue
+    """
+    try:
+        deposit_amount = amount
+        logger.info(f"💸 Starting deposit process: {deposit_amount}円")
+
+        # 1. 入金ウィンドウを開く
+        deposit_page = await open_deposit_window(page)
+        if not deposit_page:
+            return False
+
+        # 2. 入金指示フォームへ遷移
+        if not await navigate_to_deposit_form(deposit_page):
+            await deposit_page.close()
+            return False
+
+        # 3. 入金フォームを入力して送信
+        if not await complete_and_submit_deposit(deposit_page, credentials, deposit_amount):
+            await deposit_page.close()
+            return False
+
+        # 4. 入金ウィンドウを閉じる
+        await deposit_page.close()
+
+        # 5. 残高反映を確認
+        return await verify_deposit_balance(page, deposit_amount)
 
     except Exception as e:
         logger.error(f"❌ Deposit failed: {e}")
