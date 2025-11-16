@@ -1171,20 +1171,9 @@ async def select_race_simple(page: Page, racecourse: str, race_number: int):
         return False
 
 
-async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name: str, bet_amount: int):
-    """馬を選択して投票（シンプル版）"""
+async def select_horse_on_page(page: Page, horse_number: int) -> bool:
+    """ページ上で馬を選択"""
     try:
-        logger.info(f"🎯 Selecting horse #{horse_number} {horse_name}, bet {bet_amount} yen...")
-
-        # 購入前に残高をチェック（念のため）
-        balance = await get_current_balance(page)
-        if balance < bet_amount:
-            logger.error(f"❌ Insufficient balance! Required: {bet_amount:,}円, Available: {balance:,}円")
-            await take_screenshot(page, f"insufficient_balance_{horse_number}")
-            return False
-
-        await page.wait_for_timeout(Timeouts.LONG)
-
         # スクロール（大きい番号の場合）
         if horse_number >= 9:
             logger.info("Scrolling for larger horse numbers...")
@@ -1234,7 +1223,15 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
                 raise Exception(f"Not enough labels found: {len(labels)} < {horse_number + 8}")
 
         await page.wait_for_timeout(Timeouts.MEDIUM)
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to select horse: {e}")
+        return False
 
+
+async def complete_bet_input_form(page: Page, bet_amount: int) -> bool:
+    """馬券入力フォームを完成させる"""
+    try:
         # セットのクリック
         buttons = await page.query_selector_all('button')
         for button in buttons:
@@ -1271,8 +1268,16 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
 
         await page.wait_for_timeout(Timeouts.LONG)
         await take_screenshot(page, "before_purchase")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to complete bet input form: {e}")
+        return False
 
-        # 購入ボタン
+
+async def add_bet_to_cart(page: Page, horse_name: str, bet_amount: int) -> bool:
+    """馬券をカートに追加（セット処理）"""
+    try:
+        # 購入ボタン（実際にはカートに追加）
         buttons = await page.query_selector_all('button')
         for button in buttons:
             text = await button.text_content()
@@ -1343,7 +1348,15 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
 
         # ここまでで「セット」(カートに追加)が完了
         logger.info(f"✅ Bet added to cart: {horse_name} - {bet_amount} yen")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to add bet to cart: {e}")
+        return False
 
+
+async def confirm_and_purchase_bet(page: Page) -> bool:
+    """投票内容を確認して購入を実行"""
+    try:
         # 実際の「購入」処理を実行
         await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, "after_set")
@@ -1412,6 +1425,15 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
             await take_screenshot(page, "final_purchase_button_not_found")
             return False
 
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to confirm and purchase bet: {e}")
+        return False
+
+
+async def verify_purchase_completion(page: Page, horse_name: str, bet_amount: int) -> bool:
+    """購入完了を確認"""
+    try:
         # 購入確認ダイアログの処理
         await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, "final_purchase_confirmation")
@@ -1438,6 +1460,46 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
             logger.error(f"Page text: {page_text_final[:500]}")
             await take_screenshot(page, "purchase_completion_failed")
             return False
+    except Exception as e:
+        logger.error(f"❌ Failed to verify purchase completion: {e}")
+        return False
+
+
+async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name: str, bet_amount: int):
+    """馬を選択して投票（シンプル版）"""
+    try:
+        logger.info(f"🎯 Selecting horse #{horse_number} {horse_name}, bet {bet_amount} yen...")
+
+        # 購入前に残高をチェック（念のため）
+        balance = await get_current_balance(page)
+        if balance < bet_amount:
+            logger.error(f"❌ Insufficient balance! Required: {bet_amount:,}円, Available: {balance:,}円")
+            await take_screenshot(page, f"insufficient_balance_{horse_number}")
+            return False
+
+        await page.wait_for_timeout(Timeouts.LONG)
+
+        # 1. 馬を選択
+        if not await select_horse_on_page(page, horse_number):
+            return False
+
+        # 2. 馬券入力フォームを完成
+        if not await complete_bet_input_form(page, bet_amount):
+            return False
+
+        # 3. 馬券をカートに追加
+        if not await add_bet_to_cart(page, horse_name, bet_amount):
+            return False
+
+        # 4. 投票内容を確認して購入
+        if not await confirm_and_purchase_bet(page):
+            return False
+
+        # 5. 購入完了を確認
+        if not await verify_purchase_completion(page, horse_name, bet_amount):
+            return False
+
+        return True
 
     except Exception as e:
         logger.error(f"Failed to place bet: {e}")
