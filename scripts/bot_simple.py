@@ -1085,8 +1085,168 @@ async def login_simple(page: Page, credentials: dict):
         raise
 
 
+async def check_already_on_vote_page(page: Page) -> bool:
+    """
+    既に投票ページにいるかチェック
+
+    Returns:
+        既に投票ページにいればTrue
+    """
+    # 競馬場タブが表示されていて、モーダルがない場合は既に投票ページにいる
+    racecourse_tabs = await page.query_selector_all('[class*="jyoTab"], [class*="field"]')
+    modals = await page.query_selector_all('.modal, [class*="dialog"]')
+    visible_modals = []
+    for modal in modals:
+        if await modal.is_visible():
+            visible_modals.append(modal)
+
+    if len(racecourse_tabs) >= 3 and len(visible_modals) == 0:
+        logger.info("✓ Already on clean vote page, skipping navigation")
+        await take_screenshot(page, "vote_page")
+        return True
+
+    return False
+
+
+async def close_visible_modals(page: Page):
+    """
+    表示されているモーダルを閉じる
+    """
+    modals = await page.query_selector_all('.modal, [class*="dialog"]')
+    visible_modals = []
+    for modal in modals:
+        if await modal.is_visible():
+            visible_modals.append(modal)
+
+    if len(visible_modals) > 0:
+        logger.info(f"Found {len(visible_modals)} visible modals, trying to close...")
+        # OK/閉じるボタンを探してクリック
+        all_buttons = await page.query_selector_all('button, input[type="button"]')
+        for btn in all_buttons:
+            try:
+                if await btn.is_visible():
+                    text = await btn.text_content()
+                    if text and ("OK" in text or "閉じる" in text):
+                        await btn.click()
+                        logger.info(f"✓ Clicked close button: {text.strip()}")
+                        await page.wait_for_timeout(Timeouts.SHORT)
+                        break
+            except:
+                pass
+
+
+async def click_vote_menu_link(page: Page):
+    """
+    投票メニューリンクをクリック（トップメニューから投票選択画面へ）
+    """
+    all_links = await page.query_selector_all('a, button, div[ng-click]')
+    for link in all_links:
+        try:
+            text = await link.text_content()
+            if text and "投票メニュー" in text:
+                logger.info("✓ Clicking '投票メニュー' link to reset vote page")
+                await link.click()
+                await page.wait_for_timeout(Timeouts.MEDIUM)
+                break
+        except:
+            pass
+
+
+async def find_and_click_vote_button_in_main_page(page: Page) -> bool:
+    """
+    メインページで通常投票ボタンを探してクリック
+
+    Returns:
+        ボタンが見つかってクリックできたらTrue
+    """
+    # すべてのボタンをデバッグ出力
+    buttons = await page.query_selector_all('button')
+    logger.info(f"Found {len(buttons)} buttons on page")
+    for i, button in enumerate(buttons[:10]):  # 最初の10個を表示
+        text = await button.text_content()
+        logger.info(f"Button {i}: '{text.strip() if text else ''}'")
+
+    # "通常"と"投票"を含むボタンを探す
+    for button in buttons:
+        text = await button.text_content()
+        if text and "通常" in text and "投票" in text:
+            # JavaScriptクリックを使用（要素が他の要素に隠れていてもOK）
+            try:
+                await button.evaluate("el => el.click()")
+                logger.info(f"✓ Clicked vote button (JS click): {text.strip()}")
+            except Exception as e:
+                logger.warning(f"JS click failed, trying normal click: {e}")
+                await button.click()
+                logger.info(f"✓ Clicked vote button: {text.strip()}")
+            await page.wait_for_timeout(Timeouts.LONG)
+
+            # 投票ボタンクリック後にモーダルが出る場合があるので再度チェック
+            try:
+                post_click_modals = await page.query_selector_all('.modal, [class*="dialog"], [role="dialog"]')
+                for modal in post_click_modals:
+                    if await modal.is_visible():
+                        # "このまま進む" や "OK" ボタンを探してクリック
+                        modal_buttons = await modal.query_selector_all('button, input[type="button"]')
+                        for mbtn in modal_buttons:
+                            try:
+                                mtext = await mbtn.text_content()
+                                if mtext and ("このまま進む" in mtext or "OK" in mtext or "進む" in mtext):
+                                    await mbtn.click()
+                                    logger.info(f"✓ Closed post-vote modal: {mtext.strip()}")
+                                    await page.wait_for_timeout(Timeouts.MEDIUM)
+                                    break
+                            except:
+                                pass
+                        break
+            except Exception as e:
+                logger.debug(f"No post-vote modals: {e}")
+
+            await take_screenshot(page, "vote_page")
+            return True
+
+    return False
+
+
+async def find_and_click_vote_button_in_frames(page: Page) -> bool:
+    """
+    フレーム内で通常投票ボタンを探してクリック
+
+    Returns:
+        ボタンが見つかってクリックできたらTrue
+    """
+    frames = page.frames
+    logger.info(f"Checking {len(frames)} frames")
+    for i, frame in enumerate(frames):
+        try:
+            frame_buttons = await frame.query_selector_all('button')
+            logger.info(f"Frame {i} has {len(frame_buttons)} buttons")
+            for button in frame_buttons:
+                text = await button.text_content()
+                if text and "通常" in text and "投票" in text:
+                    # JavaScriptクリックを使用
+                    try:
+                        await button.evaluate("el => el.click()")
+                        logger.info(f"✓ Clicked vote button in frame {i} (JS click): {text.strip()}")
+                    except Exception as e:
+                        logger.warning(f"JS click failed in frame {i}, trying normal click: {e}")
+                        await button.click()
+                        logger.info(f"✓ Clicked vote button in frame {i}: {text.strip()}")
+                    await page.wait_for_timeout(Timeouts.LONG)
+                    await take_screenshot(page, "vote_page")
+                    return True
+        except Exception as e:
+            logger.debug(f"Frame {i} error: {e}")
+
+    return False
+
+
 async def navigate_to_vote_simple(page: Page):
-    """投票画面へ移動（シンプル版）"""
+    """
+    投票画面へ移動（シンプル版）
+
+    Returns:
+        成功したらTrue
+    """
     try:
         logger.info("📋 Navigating to vote page...")
 
@@ -1098,120 +1258,25 @@ async def navigate_to_vote_simple(page: Page):
         page_content = await page.content()
         logger.info(f"Page content length: {len(page_content)}")
 
-        # 既に投票選択画面にいるかチェック（競馬場タブが表示されていて、モーダルがない）
-        racecourse_tabs = await page.query_selector_all('[class*="jyoTab"], [class*="field"]')
-        modals = await page.query_selector_all('.modal, [class*="dialog"]')
-        visible_modals = []
-        for modal in modals:
-            if await modal.is_visible():
-                visible_modals.append(modal)
-
-        if len(racecourse_tabs) >= 3 and len(visible_modals) == 0:
-            logger.info("✓ Already on clean vote page, skipping navigation")
-            await take_screenshot(page, "vote_page")
+        # 1. 既に投票ページにいるかチェック
+        if await check_already_on_vote_page(page):
             return True
 
-        # モーダルがある場合は閉じる試み - 複数の方法で
-        if len(visible_modals) > 0:
-            logger.info(f"Found {len(visible_modals)} visible modals, trying to close...")
-            # 方法1: OK/閉じるボタンを探してクリック
-            all_buttons = await page.query_selector_all('button, input[type="button"]')
-            for btn in all_buttons:
-                try:
-                    if await btn.is_visible():
-                        text = await btn.text_content()
-                        if text and ("OK" in text or "閉じる" in text):
-                            await btn.click()
-                            logger.info(f"✓ Clicked close button: {text.strip()}")
-                            await page.wait_for_timeout(Timeouts.SHORT)
-                            break
-                except:
-                    pass
+        # 2. モーダルを閉じる
+        await close_visible_modals(page)
 
-        # 投票メニューリンクを探してクリック（トップメニューから投票選択画面へ）
-        all_links = await page.query_selector_all('a, button, div[ng-click]')
-        for link in all_links:
-            try:
-                text = await link.text_content()
-                if text and "投票メニュー" in text:
-                    logger.info("✓ Clicking '投票メニュー' link to reset vote page")
-                    await link.click()
-                    await page.wait_for_timeout(Timeouts.MEDIUM)
-                    # ここから通常投票ボタンを探す
-                    break
-            except:
-                pass
+        # 3. 投票メニューリンクをクリック
+        await click_vote_menu_link(page)
 
         await page.wait_for_timeout(Timeouts.MEDIUM)
 
-        # すべてのボタンをデバッグ出力
-        buttons = await page.query_selector_all('button')
-        logger.info(f"Found {len(buttons)} buttons on page")
-        for i, button in enumerate(buttons[:10]):  # 最初の10個を表示
-            text = await button.text_content()
-            logger.info(f"Button {i}: '{text.strip() if text else ''}'")
+        # 4. メインページで通常投票ボタンを探してクリック
+        if await find_and_click_vote_button_in_main_page(page):
+            return True
 
-        # "通常"と"投票"を含むボタンを探す
-        for button in buttons:
-            text = await button.text_content()
-            if text and "通常" in text and "投票" in text:
-                # JavaScriptクリックを使用（要素が他の要素に隠れていてもOK）
-                try:
-                    await button.evaluate("el => el.click()")
-                    logger.info(f"✓ Clicked vote button (JS click): {text.strip()}")
-                except Exception as e:
-                    logger.warning(f"JS click failed, trying normal click: {e}")
-                    await button.click()
-                    logger.info(f"✓ Clicked vote button: {text.strip()}")
-                await page.wait_for_timeout(Timeouts.LONG)
-
-                # 投票ボタンクリック後にモーダルが出る場合があるので再度チェック
-                try:
-                    post_click_modals = await page.query_selector_all('.modal, [class*="dialog"], [role="dialog"]')
-                    for modal in post_click_modals:
-                        if await modal.is_visible():
-                            # "このまま進む" や "OK" ボタンを探してクリック
-                            modal_buttons = await modal.query_selector_all('button, input[type="button"]')
-                            for mbtn in modal_buttons:
-                                try:
-                                    mtext = await mbtn.text_content()
-                                    if mtext and ("このまま進む" in mtext or "OK" in mtext or "進む" in mtext):
-                                        await mbtn.click()
-                                        logger.info(f"✓ Closed post-vote modal: {mtext.strip()}")
-                                        await page.wait_for_timeout(Timeouts.MEDIUM)
-                                        break
-                                except:
-                                    pass
-                            break
-                except Exception as e:
-                    logger.debug(f"No post-vote modals: {e}")
-
-                await take_screenshot(page, "vote_page")
-                return True
-
-        # フレームをチェック
-        frames = page.frames
-        logger.info(f"Checking {len(frames)} frames")
-        for i, frame in enumerate(frames):
-            try:
-                frame_buttons = await frame.query_selector_all('button')
-                logger.info(f"Frame {i} has {len(frame_buttons)} buttons")
-                for button in frame_buttons:
-                    text = await button.text_content()
-                    if text and "通常" in text and "投票" in text:
-                        # JavaScriptクリックを使用
-                        try:
-                            await button.evaluate("el => el.click()")
-                            logger.info(f"✓ Clicked vote button in frame {i} (JS click): {text.strip()}")
-                        except Exception as e:
-                            logger.warning(f"JS click failed in frame {i}, trying normal click: {e}")
-                            await button.click()
-                            logger.info(f"✓ Clicked vote button in frame {i}: {text.strip()}")
-                        await page.wait_for_timeout(Timeouts.LONG)
-                        await take_screenshot(page, "vote_page")
-                        return True
-            except Exception as e:
-                logger.debug(f"Frame {i} error: {e}")
+        # 5. フレーム内で通常投票ボタンを探してクリック
+        if await find_and_click_vote_button_in_frames(page):
+            return True
 
         logger.error("❌ Vote button not found")
         await take_screenshot(page, "vote_button_not_found")
