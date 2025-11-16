@@ -836,16 +836,14 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
         return False
 
 
-async def login_simple(page: Page, credentials: dict):
-    """Seleniumコードベースのシンプルなログイン"""
+async def perform_stage1_login(page: Page, credentials: dict):
+    """
+    第1段階ログイン: INET-ID入力
+
+    Returns:
+        成功したらTrue
+    """
     try:
-        logger.info("🔐 Starting simple IPAT login...")
-
-        # ログイン画面の表示（PC版 - 2段階ログイン）
-        await page.goto(IPAT_URL)
-        await page.wait_for_timeout(Timeouts.LONG)
-
-        # ========== 第1段階: INET-ID入力 ==========
         logger.info("🔐 Stage 1: INET-ID login")
         await page.fill('input[name="inetid"]', credentials['inet_id'])
         logger.info("✓ INET-ID entered")
@@ -855,8 +853,21 @@ async def login_simple(page: Page, credentials: dict):
         await page.wait_for_timeout(Timeouts.LONG)
         logger.info("✓ Stage 1 button clicked")
         await take_screenshot(page, "after_stage1")
+        return True
 
-        # ========== 第2段階: 加入者番号、暗証番号、P-ARS番号入力 ==========
+    except Exception as e:
+        logger.error(f"❌ Stage 1 login failed: {e}")
+        return False
+
+
+async def perform_stage2_login(page: Page, credentials: dict):
+    """
+    第2段階ログイン: 加入者番号、暗証番号、P-ARS番号入力
+
+    Returns:
+        成功したらTrue
+    """
+    try:
         logger.info("🔐 Stage 2: User credentials")
 
         # 加入者番号の入力
@@ -890,126 +901,183 @@ async def login_simple(page: Page, credentials: dict):
             with open("output/error_page.html", "w", encoding="utf-8") as f:
                 f.write(html)
             logger.error("HTML saved to output/error_page.html")
+            return False
 
         await take_screenshot(page, "after_stage2")
-
-        # お知らせなどの確認画面の判定(OKがあればOKをクリック)
-        try:
-            await page.wait_for_timeout(Timeouts.LONG)
-            buttons = await page.query_selector_all('button')
-            for button in buttons:
-                text = await button.text_content()
-                if text and "OK" in text:
-                    await button.click()
-                    logger.info("✓ OK button clicked")
-                    await page.wait_for_timeout(Timeouts.LONG)
-                    break
-        except Exception as e:
-            logger.debug(f"No OK button found (normal): {e}")
-
-        # メインフレームの読み込みを待つ
-        await page.wait_for_timeout(Timeouts.VERY_LONG)
-
-        # ログイン成功/失敗の判定
-        page_text = await page.evaluate("document.body.innerText")
-
-        # ログインフォームが再表示されている場合はログイン失敗
-        if "加入者番号" in page_text and "暗証番号" in page_text and "P-ARS番号" in page_text:
-            logger.error("❌ ログイン失敗: ログインフォームが再表示されています")
-            logger.error("以下のいずれかの可能性があります:")
-            logger.error("  1. アカウントがロックされている")
-            logger.error("  2. 認証情報が間違っている")
-            logger.error("  3. システムエラー")
-            logger.error("")
-            logger.error("JRA IPATサポートセンターに連絡してアカウント状況を確認してください")
-            await take_screenshot(page, "login_failed")
-            raise Exception("Login failed: Login form was displayed again after submission")
-
-        logger.info("✓ ログインフォームは表示されていません - ログイン処理は正常に進んでいます")
-
-        # フレームの確認と切り替え
-        logger.info(f"Checking frames... total: {len(page.frames)}")
-        main_frame = None
-        for i, frame in enumerate(page.frames):
-            try:
-                frame_url = frame.url
-                logger.info(f"Frame {i}: {frame_url}")
-                # メインフレームを探す（通常、/cgi-bin/ を含むURLがメインコンテンツ）
-                if "/cgi-bin/" in frame_url or "main" in frame_url.lower():
-                    main_frame = frame
-                    logger.info(f"Found main frame: {frame_url}")
-                    break
-            except Exception as e:
-                logger.debug(f"Error checking frame {i}: {e}")
-
-        # メインフレームが見つからなければメインページを使用
-        if not main_frame:
-            logger.info("No main frame found, using main page")
-            main_frame = page
-        else:
-            # メインフレームに切り替わるまで待つ
-            await page.wait_for_timeout(Timeouts.NAVIGATION)
-
-        # 残高確認（メインフレーム内で）
-        # まずページ全体のHTMLを保存してデバッグ
-        html_content = await page.content()
-        with open("output/login_after_page.html", "w", encoding="utf-8") as f:
-            f.write(html_content)
-        logger.info("✓ HTML saved for debugging: output/login_after_page.html")
-
-        # ページの全テキストを確認
-        body_text = await page.evaluate("document.body.innerText")
-        logger.info(f"Page text (first 500 chars): {body_text[:500]}")
-
-        max_retries = 5
-        balance = None
-        for i in range(max_retries):
-            tds = await main_frame.query_selector_all('td')
-            logger.info(f"Found {len(tds)} td elements in frame")
-
-            # デバッグ: 最初の試行でtd要素のテキストをログ出力
-            if i == 0:
-                for idx, td in enumerate(tds[:15]):  # 最初の15個
-                    text = await td.text_content()
-                    logger.info(f"  TD[{idx}]: '{text.strip() if text else ''}'")
-
-            # td要素で残高を探す
-            for td in tds:
-                text = await td.text_content()
-                if text and "円" in text:
-                    logger.info(f"✓ Balance found: {text.strip()}")
-                    # 残高を数値として抽出
-                    try:
-                        balance = int(text.replace(",", "").replace("円", "").strip())
-                        logger.info(f"💰 Current balance: {balance}円")
-                    except:
-                        pass
-                    break
-
-            # td要素で見つからない場合は、ページ全体のテキストから"円"を含む部分を探す
-            if balance is None and "円" in body_text:
-                logger.info("Trying to find balance in body text...")
-                import re
-                # 数字とカンマと円のパターンを探す
-                matches = re.findall(r'(\d{1,3}(?:,\d{3})*)\s*円', body_text)
-                if matches:
-                    logger.info(f"Found {len(matches)} potential balance values: {matches}")
-                    # 最初の値を残高として使用
-                    try:
-                        balance = int(matches[0].replace(",", ""))
-                        logger.info(f"💰 Current balance (from text): {balance}円")
-                    except:
-                        pass
-
-            if balance is not None:
-                break
-            logger.info(f"Waiting for balance... ({i+1}/{max_retries})")
-            await page.wait_for_timeout(Timeouts.NAVIGATION)
-
-        await page.wait_for_timeout(Timeouts.MEDIUM)
-        await take_screenshot(page, "login_complete")
-        logger.info("✅ Login completed successfully")
         return True
+
+    except Exception as e:
+        logger.error(f"❌ Stage 2 login failed: {e}")
+        return False
+
+
+async def handle_ok_dialog(page: Page):
+    """
+    OKダイアログが表示された場合の処理
+
+    Returns:
+        なし（OKボタンがない場合も正常）
+    """
+    try:
+        await page.wait_for_timeout(Timeouts.LONG)
+        buttons = await page.query_selector_all('button')
+        for button in buttons:
+            text = await button.text_content()
+            if text and "OK" in text:
+                await button.click()
+                logger.info("✓ OK button clicked")
+                await page.wait_for_timeout(Timeouts.LONG)
+                break
+    except Exception as e:
+        logger.debug(f"No OK button found (normal): {e}")
+
+
+async def verify_login_success(page: Page):
+    """
+    ログイン成功の確認と残高取得
+
+    Returns:
+        成功したらTrue
+
+    Raises:
+        Exception: ログイン失敗時
+    """
+    # メインフレームの読み込みを待つ
+    await page.wait_for_timeout(Timeouts.VERY_LONG)
+
+    # ログイン成功/失敗の判定
+    page_text = await page.evaluate("document.body.innerText")
+
+    # ログインフォームが再表示されている場合はログイン失敗
+    if "加入者番号" in page_text and "暗証番号" in page_text and "P-ARS番号" in page_text:
+        logger.error("❌ ログイン失敗: ログインフォームが再表示されています")
+        logger.error("以下のいずれかの可能性があります:")
+        logger.error("  1. アカウントがロックされている")
+        logger.error("  2. 認証情報が間違っている")
+        logger.error("  3. システムエラー")
+        logger.error("")
+        logger.error("JRA IPATサポートセンターに連絡してアカウント状況を確認してください")
+        await take_screenshot(page, "login_failed")
+        raise Exception("Login failed: Login form was displayed again after submission")
+
+    logger.info("✓ ログインフォームは表示されていません - ログイン処理は正常に進んでいます")
+
+    # フレームの確認と切り替え
+    logger.info(f"Checking frames... total: {len(page.frames)}")
+    main_frame = None
+    for i, frame in enumerate(page.frames):
+        try:
+            frame_url = frame.url
+            logger.info(f"Frame {i}: {frame_url}")
+            # メインフレームを探す（通常、/cgi-bin/ を含むURLがメインコンテンツ）
+            if "/cgi-bin/" in frame_url or "main" in frame_url.lower():
+                main_frame = frame
+                logger.info(f"Found main frame: {frame_url}")
+                break
+        except Exception as e:
+            logger.debug(f"Error checking frame {i}: {e}")
+
+    # メインフレームが見つからなければメインページを使用
+    if not main_frame:
+        logger.info("No main frame found, using main page")
+        main_frame = page
+    else:
+        # メインフレームに切り替わるまで待つ
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
+
+    # 残高確認（メインフレーム内で）
+    # まずページ全体のHTMLを保存してデバッグ
+    html_content = await page.content()
+    with open("output/login_after_page.html", "w", encoding="utf-8") as f:
+        f.write(html_content)
+    logger.info("✓ HTML saved for debugging: output/login_after_page.html")
+
+    # ページの全テキストを確認
+    body_text = await page.evaluate("document.body.innerText")
+    logger.info(f"Page text (first 500 chars): {body_text[:500]}")
+
+    max_retries = 5
+    balance = None
+    for i in range(max_retries):
+        tds = await main_frame.query_selector_all('td')
+        logger.info(f"Found {len(tds)} td elements in frame")
+
+        # デバッグ: 最初の試行でtd要素のテキストをログ出力
+        if i == 0:
+            for idx, td in enumerate(tds[:15]):  # 最初の15個
+                text = await td.text_content()
+                logger.info(f"  TD[{idx}]: '{text.strip() if text else ''}'")
+
+        # td要素で残高を探す
+        for td in tds:
+            text = await td.text_content()
+            if text and "円" in text:
+                logger.info(f"✓ Balance found: {text.strip()}")
+                # 残高を数値として抽出
+                try:
+                    balance = int(text.replace(",", "").replace("円", "").strip())
+                    logger.info(f"💰 Current balance: {balance}円")
+                except:
+                    pass
+                break
+
+        # td要素で見つからない場合は、ページ全体のテキストから"円"を含む部分を探す
+        if balance is None and "円" in body_text:
+            logger.info("Trying to find balance in body text...")
+            import re
+            # 数字とカンマと円のパターンを探す
+            matches = re.findall(r'(\d{1,3}(?:,\d{3})*)\s*円', body_text)
+            if matches:
+                logger.info(f"Found {len(matches)} potential balance values: {matches}")
+                # 最初の値を残高として使用
+                try:
+                    balance = int(matches[0].replace(",", ""))
+                    logger.info(f"💰 Current balance (from text): {balance}円")
+                except:
+                    pass
+
+        if balance is not None:
+            break
+        logger.info(f"Waiting for balance... ({i+1}/{max_retries})")
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
+
+    await page.wait_for_timeout(Timeouts.MEDIUM)
+    await take_screenshot(page, "login_complete")
+    logger.info("✅ Login completed successfully")
+    return True
+
+
+async def login_simple(page: Page, credentials: dict):
+    """
+    シンプルなIPATログイン処理
+
+    Args:
+        page: Playwright page
+        credentials: 認証情報
+
+    Returns:
+        成功したらTrue
+    """
+    try:
+        logger.info("🔐 Starting simple IPAT login...")
+
+        # ログイン画面へ移動
+        await page.goto(IPAT_URL)
+        await page.wait_for_timeout(Timeouts.LONG)
+
+        # 1. 第1段階ログイン (INET-ID)
+        if not await perform_stage1_login(page, credentials):
+            raise Exception("Stage 1 login failed")
+
+        # 2. 第2段階ログイン (ユーザー認証情報)
+        if not await perform_stage2_login(page, credentials):
+            raise Exception("Stage 2 login failed")
+
+        # 3. OKダイアログの処理
+        await handle_ok_dialog(page)
+
+        # 4. ログイン成功確認と残高取得
+        return await verify_login_success(page)
 
     except Exception as e:
         logger.error(f"❌ Login failed: {e}")
