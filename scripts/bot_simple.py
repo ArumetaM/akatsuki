@@ -20,6 +20,9 @@ from enum import Enum
 # 定数のインポート
 from constants import Timeouts, UIIndices, URLs, Config
 
+# ユーティリティのインポート
+from page_navigator import PageNavigator
+
 # 環境変数読み込み
 load_dotenv()
 
@@ -164,34 +167,26 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
     try:
         logger.info("📋 Fetching existing bets from 投票内容照会...")
 
+        # PageNavigatorのインスタンス化
+        navigator = PageNavigator(page, logger)
+
         # メインメニューに戻る
         await page.goto(IPAT_HOME_URL)
         await page.wait_for_timeout(Timeouts.NAVIGATION)
 
         # 「投票履歴」ボタンをクリック
         try:
-            # テキストで検索
             await page.wait_for_timeout(Timeouts.MEDIUM)
 
             # ページのテキストを取得してデバッグ
             body_text = await page.evaluate("document.body.innerText")
             logger.info(f"Page text (first 500 chars): {body_text[:500]}")
 
-            # 「投票履歴」ボタンを探す
-            履歴_found = False
-
-            # 方法1: 直接「投票履歴」ボタンを探す
-            if "投票履歴" in body_text:
-                logger.info("✓ Found 投票履歴 in page text")
-                # クリック可能な要素を探す
-                buttons = await page.query_selector_all('button, a, div[role="button"]')
-                for button in buttons:
-                    text = await button.text_content()
-                    if text and "投票履歴" in text:
-                        logger.info(f"✓ Clicking button: {text.strip()}")
-                        await button.click()
-                        履歴_found = True
-                        break
+            # PageNavigatorを使用してボタンをクリック
+            履歴_found = "投票履歴" in body_text and await navigator.find_and_click_by_text(
+                "投票履歴",
+                element_types=['button', 'a', 'div[role="button"]']
+            )
 
             if not 履歴_found:
                 logger.warning("⚠️ Could not find 投票履歴 button, will try alternative approach")
@@ -205,24 +200,16 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
             # 「投票内容照会（当日分/前日分）」を選択
             if date_type == "same_day":
                 logger.info("Selecting 当日分...")
-                # 当日分のボタン/リンクをクリック
-                当日_buttons = await page.query_selector_all('button, a, div[role="button"]')
-                for button in 当日_buttons:
-                    text = await button.text_content()
-                    if text and "当日" in text:
-                        logger.info(f"✓ Clicking: {text.strip()}")
-                        await button.click()
-                        break
+                await navigator.find_and_click_by_text(
+                    "当日",
+                    element_types=['button', 'a', 'div[role="button"]', 'label']
+                )
             else:
                 logger.info("Selecting 前日分...")
-                # 前日分のボタン/リンクをクリック
-                前日_buttons = await page.query_selector_all('button, a, div[role="button"]')
-                for button in 前日_buttons:
-                    text = await button.text_content()
-                    if text and "前日" in text:
-                        logger.info(f"✓ Clicking: {text.strip()}")
-                        await button.click()
-                        break
+                await navigator.find_and_click_by_text(
+                    "前日",
+                    element_types=['button', 'a', 'div[role="button"]', 'label']
+                )
 
             await page.wait_for_timeout(Timeouts.NAVIGATION)
 
