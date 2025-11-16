@@ -1599,143 +1599,306 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
         return False
 
 
+async def load_configuration():
+    """
+    認証情報とチケットファイルを読み込む
+
+    Returns:
+        Tuple[dict, dict, Path]: (credentials, slack_info, tickets_path)
+    """
+    # 認証情報取得
+    credentials, slack_info = await get_all_secrets()
+
+    # tickets.csv読み込み（日付指定または最新）
+    tickets_date = os.environ.get('TICKETS_DATE', None)
+
+    if tickets_date:
+        # 日付指定がある場合、そのファイルを読む
+        tickets_path = Path(f'tickets/tickets_{tickets_date}.csv')
+    else:
+        # 日付指定がない場合、tickets_YYYYMMDD.csvの最新ファイルを探す
+        tickets_dir = Path('tickets')
+        dated_files = sorted(tickets_dir.glob('tickets_????????.csv'), reverse=True)
+        if dated_files:
+            tickets_path = dated_files[0]  # 最新のファイル
+            logger.info(f"📅 Using latest tickets file: {tickets_path.name}")
+        else:
+            # 日付なしのtickets.csvにフォールバック
+            tickets_path = Path('tickets/tickets.csv')
+
+    if not tickets_path.exists():
+        logger.error(f"❌ Tickets file not found: {tickets_path}")
+        raise FileNotFoundError(f"Tickets file not found: {tickets_path}")
+
+    return credentials, slack_info, tickets_path
+
+
+async def initialize_browser_and_session(p, credentials):
+    """
+    ブラウザとセッションを初期化
+
+    Returns:
+        Tuple[Browser, BrowserContext, Page]: (browser, context, page)
+    """
+    browser = await p.chromium.launch(
+        headless=True,
+        args=['--no-sandbox', '--disable-setuid-sandbox']
+    )
+
+    # セッション情報の復元を試みる
+    session_path = "output/session.json"
+    session_exists = Path(session_path).exists()
+
+    if session_exists:
+        logger.info("🔄 Restoring session from saved state...")
+        try:
+            context = await browser.new_context(
+                storage_state=session_path,
+                viewport={'width': 1280, 'height': 720}
+            )
+            logger.info("✓ Session restored successfully")
+        except Exception as e:
+            logger.warning(f"Failed to restore session: {e}")
+            logger.info("Will proceed with fresh login...")
+            context = await browser.new_context(
+                viewport={'width': 1280, 'height': 720}
+            )
+            session_exists = False
+    else:
+        logger.info("📝 No saved session found, will login normally")
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 720}
+        )
+
+    page = await context.new_page()
+
+    # セッションが無い場合のみログイン
+    if not session_exists:
+        await login_simple(page, credentials)
+
+        # ログイン成功後、セッション情報を保存
+        logger.info("💾 Saving session state...")
+        Path(session_path).parent.mkdir(parents=True, exist_ok=True)
+        await context.storage_state(path=session_path)
+        logger.info(f"✓ Session saved to {session_path}")
+    else:
+        # セッションを使う場合でも、ログイン状態を確認
+        await page.goto(IPAT_URL)
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
+        page_text = await page.evaluate("document.body.innerText")
+
+        # ログインフォームが表示されている場合はセッション期限切れ
+        if "INET-ID" in page_text or "加入者番号" in page_text:
+            logger.warning("⚠️ Session expired, logging in again...")
+            await login_simple(page, credentials)
+            await context.storage_state(path=session_path)
+            logger.info("✓ Session refreshed")
+        else:
+            logger.info("✓ Session is still valid")
+
+    return browser, context, page
+
+
+async def load_and_reconcile_tickets(page: Page, tickets_path: Path):
+    """
+    チケットCSVを読み込み、既存投票と突合
+
+    Returns:
+        Tuple[List[Ticket], List[ReconciliationResult], List[Ticket]]:
+        (tickets, reconciliation_results, to_purchase)
+    """
+    # CSVを読み込む
+    tickets_df = pd.read_csv(tickets_path)
+    logger.info(f"📄 Found {len(tickets_df)} tickets to process from {tickets_path.name}")
+
+    # tickets.csvをTicketオブジェクトに変換
+    tickets = []
+    for _, row in tickets_df.iterrows():
+        ticket = Ticket(
+            racecourse=row['race_course'],
+            race_number=int(row['race_number']),
+            bet_type=row.get('bet_type', '単勝'),  # デフォルト: 単勝
+            horse_number=int(row['horse_number']),
+            horse_name=row['horse_name'],
+            amount=int(row['amount'])
+        )
+        tickets.append(ticket)
+
+    logger.info(f"📄 Loaded {len(tickets)} tickets from CSV")
+
+    # 既存の投票を取得（冪等性チェック）
+    existing_bets = await fetch_existing_bets(page, date_type="same_day")
+
+    # 突合処理
+    reconciliation_results = reconcile_tickets(tickets, existing_bets)
+
+    # 未購入のチケットのみを抽出
+    to_purchase = [
+        r.ticket for r in reconciliation_results
+        if r.status == TicketStatus.NOT_PURCHASED
+    ]
+
+    # サマリーレポート
+    already_purchased_count = sum(
+        1 for r in reconciliation_results
+        if r.status == TicketStatus.ALREADY_PURCHASED
+    )
+
+    logger.info("\n" + "=" * 60)
+    logger.info("RECONCILIATION SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Total tickets: {len(tickets)}")
+    logger.info(f"Already purchased: {already_purchased_count}")
+    logger.info(f"To purchase: {len(to_purchase)}")
+    logger.info("=" * 60)
+
+    return tickets, reconciliation_results, to_purchase
+
+
+async def handle_dry_run_mode(page: Page, to_purchase: List[Ticket], reconciliation_results: List):
+    """
+    DRY_RUNモードの処理
+
+    Returns:
+        bool: DRY_RUNモードならTrue（処理を終了すべき）
+    """
+    DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+    if not DRY_RUN:
+        return False
+
+    logger.warning("\n" + "=" * 60)
+    logger.warning("🔸 DRY_RUN MODE: Simulating bet placement")
+    logger.warning("=" * 60)
+    logger.warning("The following bets would be placed:")
+    for idx, ticket in enumerate(to_purchase):
+        logger.warning(f"  {idx+1}. {ticket}")
+
+    # 総費用を計算
+    total_cost = sum(t.amount for t in to_purchase)
+    logger.warning(f"\nTotal amount that would be spent: {total_cost:,}円")
+
+    # 残高確認（参考情報）
+    current_balance = await get_current_balance(page)
+    logger.warning(f"Current balance: {current_balance:,}円")
+
+    if current_balance < total_cost:
+        shortage = total_cost - current_balance
+        logger.warning(f"Would need to deposit: {shortage:,}円")
+    else:
+        logger.warning(f"Balance is sufficient (no deposit needed)")
+
+    logger.warning("=" * 60)
+    logger.warning("🔸 DRY_RUN: Skipping actual bet placement")
+    logger.warning("=" * 60)
+
+    # DRY_RUNステータスに更新
+    for result in reconciliation_results:
+        if result.status == TicketStatus.NOT_PURCHASED:
+            result.status = TicketStatus.SKIPPED_DRY_RUN
+
+    return True
+
+
+async def ensure_sufficient_balance(page: Page, credentials: dict, to_purchase: List[Ticket]) -> bool:
+    """
+    残高を確認し、不足していれば入金
+
+    Returns:
+        bool: 成功したらTrue
+    """
+    # 未購入チケットの総費用を計算
+    total_cost = sum(t.amount for t in to_purchase)
+    logger.info(f"\n💰 Total cost for unpurchased tickets: {total_cost:,}円")
+
+    # 現在の残高を確認
+    current_balance = await get_current_balance(page)
+    logger.info(f"💰 Current balance: {current_balance:,}円")
+
+    # 不足分を計算
+    if current_balance < total_cost:
+        shortage = total_cost - current_balance
+        logger.info(f"⚠️ Insufficient balance! Shortage: {shortage:,}円")
+        logger.info(f"💸 Depositing shortage amount: {shortage:,}円")
+
+        if await deposit(page, credentials, shortage):
+            logger.info(f"✅ Deposit completed: {shortage:,}円")
+            return True
+        else:
+            logger.error("❌ Deposit failed - aborting ticket processing")
+            return False
+    else:
+        logger.info(f"✅ Balance is sufficient ({current_balance:,}円 >= {total_cost:,}円), skipping deposit")
+        return True
+
+
+async def process_tickets(page: Page, to_purchase: List[Ticket]):
+    """
+    未購入チケットを処理
+
+    Args:
+        page: Playwright page
+        to_purchase: 購入すべきチケットのリスト
+    """
+    for ticket_idx, ticket in enumerate(to_purchase):
+        try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🎫 Purchasing {ticket_idx+1}/{len(to_purchase)}: {ticket}")
+            logger.info(f"{'='*60}")
+
+            # 各チケット処理の前にトップページに戻る（2つ目以降）
+            if ticket_idx > 0:
+                logger.info("🔄 Returning to top page...")
+                await page.goto(IPAT_HOME_URL)
+                await page.wait_for_timeout(Timeouts.NAVIGATION)
+                logger.info("✓ Returned to top page")
+
+            # 投票画面へ移動
+            if not await navigate_to_vote_simple(page):
+                logger.error("Failed to navigate to vote page")
+                continue
+
+            # レース選択
+            if not await select_race_simple(page, ticket.racecourse, ticket.race_number):
+                logger.error("Failed to select race")
+                continue
+
+            # 馬選択と投票
+            if await select_horse_and_bet_simple(page, ticket.horse_number, ticket.horse_name, ticket.amount):
+                logger.info(f"✅ Ticket {ticket_idx+1} completed successfully")
+            else:
+                logger.error(f"❌ Ticket {ticket_idx+1} failed")
+
+            # 次のチケットのため少し待機
+            await page.wait_for_timeout(5000)
+
+        except Exception as e:
+            logger.error(f"Error processing ticket {ticket_idx+1}: {e}")
+            continue
+
+    logger.info("\n🏁 All unpurchased tickets processed")
+
+
 async def main():
     """メイン処理"""
     try:
         logger.info("🚀 STARTING AKATSUKI BOT - SIMPLE VERSION")
 
-        # 認証情報取得
-        credentials, slack_info = await get_all_secrets()
+        # 1. 設定を読み込む
+        credentials, slack_info, tickets_path = await load_configuration()
 
-        # tickets.csv読み込み（日付指定または最新）
-        # 環境変数でtickets_dateを指定可能（例：20251116）
-        tickets_date = os.environ.get('TICKETS_DATE', None)
-
-        if tickets_date:
-            # 日付指定がある場合、そのファイルを読む
-            tickets_path = Path(f'tickets/tickets_{tickets_date}.csv')
-        else:
-            # 日付指定がない場合、tickets_YYYYMMDD.csvの最新ファイルを探す
-            tickets_dir = Path('tickets')
-            dated_files = sorted(tickets_dir.glob('tickets_????????.csv'), reverse=True)
-            if dated_files:
-                tickets_path = dated_files[0]  # 最新のファイル
-                logger.info(f"📅 Using latest tickets file: {tickets_path.name}")
-            else:
-                # 日付なしのtickets.csvにフォールバック
-                tickets_path = Path('tickets/tickets.csv')
-
-        if not tickets_path.exists():
-            logger.error(f"❌ Tickets file not found: {tickets_path}")
-            return
-
-        tickets_df = pd.read_csv(tickets_path)
-        logger.info(f"📄 Found {len(tickets_df)} tickets to process from {tickets_path.name}")
-
+        # 2. ブラウザとセッションを初期化
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
+            browser, context, page = await initialize_browser_and_session(p, credentials)
 
-            # セッション情報の復元を試みる
-            session_path = "output/session.json"
-            session_exists = Path(session_path).exists()
-
-            if session_exists:
-                logger.info("🔄 Restoring session from saved state...")
-                try:
-                    context = await browser.new_context(
-                        storage_state=session_path,
-                        viewport={'width': 1280, 'height': 720}
-                    )
-                    logger.info("✓ Session restored successfully")
-                except Exception as e:
-                    logger.warning(f"Failed to restore session: {e}")
-                    logger.info("Will proceed with fresh login...")
-                    context = await browser.new_context(
-                        viewport={'width': 1280, 'height': 720}
-                    )
-                    session_exists = False
-            else:
-                logger.info("📝 No saved session found, will login normally")
-                context = await browser.new_context(
-                    viewport={'width': 1280, 'height': 720}
-                )
-
-            page = await context.new_page()
-
-            # セッションが無い場合のみログイン
-            if not session_exists:
-                await login_simple(page, credentials)
-
-                # ログイン成功後、セッション情報を保存
-                logger.info("💾 Saving session state...")
-                Path(session_path).parent.mkdir(parents=True, exist_ok=True)
-                await context.storage_state(path=session_path)
-                logger.info(f"✓ Session saved to {session_path}")
-            else:
-                # セッションを使う場合でも、ログイン状態を確認
-                await page.goto(IPAT_URL)
-                await page.wait_for_timeout(Timeouts.NAVIGATION)
-                page_text = await page.evaluate("document.body.innerText")
-
-                # ログインフォームが表示されている場合はセッション期限切れ
-                if "INET-ID" in page_text or "加入者番号" in page_text:
-                    logger.warning("⚠️ Session expired, logging in again...")
-                    await login_simple(page, credentials)
-                    await context.storage_state(path=session_path)
-                    logger.info("✓ Session refreshed")
-                else:
-                    logger.info("✓ Session is still valid")
-
-            # DRY_RUNモード判定
+            # DRY_RUNモード通知
             DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
             if DRY_RUN:
                 logger.warning("=" * 60)
                 logger.warning("🔸 DRY_RUN MODE ENABLED")
                 logger.warning("=" * 60)
 
-            # tickets.csvをTicketオブジェクトに変換
-            tickets = []
-            for _, row in tickets_df.iterrows():
-                ticket = Ticket(
-                    racecourse=row['race_course'],
-                    race_number=int(row['race_number']),
-                    bet_type=row.get('bet_type', '単勝'),  # デフォルト: 単勝
-                    horse_number=int(row['horse_number']),
-                    horse_name=row['horse_name'],
-                    amount=int(row['amount'])
-                )
-                tickets.append(ticket)
-
-            logger.info(f"📄 Loaded {len(tickets)} tickets from CSV")
-
-            # ⭐ 既存の投票を取得（冪等性チェック）
-            existing_bets = await fetch_existing_bets(page, date_type="same_day")
-
-            # ⭐ 突合処理
-            reconciliation_results = reconcile_tickets(tickets, existing_bets)
-
-            # ⭐ 未購入のチケットのみを抽出
-            to_purchase = [
-                r.ticket for r in reconciliation_results
-                if r.status == TicketStatus.NOT_PURCHASED
-            ]
-
-            # サマリーレポート
-            already_purchased_count = sum(
-                1 for r in reconciliation_results
-                if r.status == TicketStatus.ALREADY_PURCHASED
-            )
-
-            logger.info("\n" + "=" * 60)
-            logger.info("RECONCILIATION SUMMARY")
-            logger.info("=" * 60)
-            logger.info(f"Total tickets: {len(tickets)}")
-            logger.info(f"Already purchased: {already_purchased_count}")
-            logger.info(f"To purchase: {len(to_purchase)}")
-            logger.info("=" * 60)
+            # 3. チケット読み込みと突合
+            tickets, reconciliation_results, to_purchase = await load_and_reconcile_tickets(page, tickets_path)
 
             # 全てのチケットが既に購入済みの場合
             if len(to_purchase) == 0:
@@ -1743,104 +1906,21 @@ async def main():
                 await browser.close()
                 return
 
-            # DRY_RUNモードの場合、購入をスキップ
-            if DRY_RUN:
-                logger.warning("\n" + "=" * 60)
-                logger.warning("🔸 DRY_RUN MODE: Simulating bet placement")
-                logger.warning("=" * 60)
-                logger.warning("The following bets would be placed:")
-                for idx, ticket in enumerate(to_purchase):
-                    logger.warning(f"  {idx+1}. {ticket}")
-
-                # 総費用を計算
-                total_cost = sum(t.amount for t in to_purchase)
-                logger.warning(f"\nTotal amount that would be spent: {total_cost:,}円")
-
-                # 残高確認（参考情報）
-                current_balance = await get_current_balance(page)
-                logger.warning(f"Current balance: {current_balance:,}円")
-
-                if current_balance < total_cost:
-                    shortage = total_cost - current_balance
-                    logger.warning(f"Would need to deposit: {shortage:,}円")
-                else:
-                    logger.warning(f"Balance is sufficient (no deposit needed)")
-
-                logger.warning("=" * 60)
-                logger.warning("🔸 DRY_RUN: Skipping actual bet placement")
-                logger.warning("=" * 60)
-
-                # DRY_RUNステータスに更新
-                for result in reconciliation_results:
-                    if result.status == TicketStatus.NOT_PURCHASED:
-                        result.status = TicketStatus.SKIPPED_DRY_RUN
-
+            # 4. DRY_RUNモードの処理
+            if await handle_dry_run_mode(page, to_purchase, reconciliation_results):
                 await browser.close()
                 return
 
             # ===== 通常モード: 実際に購入 =====
 
-            # 未購入チケットの総費用を計算
-            total_cost = sum(t.amount for t in to_purchase)
-            logger.info(f"\n💰 Total cost for unpurchased tickets: {total_cost:,}円")
+            # 5. 残高確認と入金
+            if not await ensure_sufficient_balance(page, credentials, to_purchase):
+                await browser.close()
+                return
 
-            # 現在の残高を確認
-            current_balance = await get_current_balance(page)
-            logger.info(f"💰 Current balance: {current_balance:,}円")
+            # 6. チケット処理
+            await process_tickets(page, to_purchase)
 
-            # 不足分を計算
-            if current_balance < total_cost:
-                shortage = total_cost - current_balance
-                logger.info(f"⚠️ Insufficient balance! Shortage: {shortage:,}円")
-                logger.info(f"💸 Depositing shortage amount: {shortage:,}円")
-
-                if await deposit(page, credentials, shortage):
-                    logger.info(f"✅ Deposit completed: {shortage:,}円")
-                else:
-                    logger.error("❌ Deposit failed - aborting ticket processing")
-                    await browser.close()
-                    return
-            else:
-                logger.info(f"✅ Balance is sufficient ({current_balance:,}円 >= {total_cost:,}円), skipping deposit")
-
-            # 未購入チケットのみ購入
-            for ticket_idx, ticket in enumerate(to_purchase):
-                try:
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"🎫 Purchasing {ticket_idx+1}/{len(to_purchase)}: {ticket}")
-                    logger.info(f"{'='*60}")
-
-                    # 各チケット処理の前にトップページに戻る（2つ目以降）
-                    if ticket_idx > 0:
-                        logger.info("🔄 Returning to top page...")
-                        await page.goto(IPAT_HOME_URL)
-                        await page.wait_for_timeout(Timeouts.NAVIGATION)
-                        logger.info("✓ Returned to top page")
-
-                    # 投票画面へ移動
-                    if not await navigate_to_vote_simple(page):
-                        logger.error("Failed to navigate to vote page")
-                        continue
-
-                    # レース選択
-                    if not await select_race_simple(page, ticket.racecourse, ticket.race_number):
-                        logger.error("Failed to select race")
-                        continue
-
-                    # 馬選択と投票
-                    if await select_horse_and_bet_simple(page, ticket.horse_number, ticket.horse_name, ticket.amount):
-                        logger.info(f"✅ Ticket {ticket_idx+1} completed successfully")
-                    else:
-                        logger.error(f"❌ Ticket {ticket_idx+1} failed")
-
-                    # 次のチケットのため少し待機
-                    await page.wait_for_timeout(5000)
-
-                except Exception as e:
-                    logger.error(f"Error processing ticket {ticket_idx+1}: {e}")
-                    continue
-
-            logger.info("\n🏁 All unpurchased tickets processed")
             await browser.close()
 
     except Exception as e:
