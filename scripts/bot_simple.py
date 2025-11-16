@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from typing import List, Optional
 from enum import Enum
 
+# 定数のインポート
+from constants import Timeouts, UIIndices, URLs, Config
+
 # 環境変数読み込み
 load_dotenv()
 
@@ -27,9 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 定数
-IPAT_URL = "https://www.ipat.jra.go.jp/"
-IPAT_HOME_URL = "https://www.ipat.jra.go.jp/2017/pw_890_i.cgi#!/"
+# 定数（後方互換性のため残す）
+IPAT_URL = URLs.IPAT_BASE
+IPAT_HOME_URL = URLs.IPAT_HOME
 
 
 # ========================================
@@ -163,12 +166,12 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
 
         # メインメニューに戻る
         await page.goto(IPAT_HOME_URL)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
 
         # 「投票履歴」ボタンをクリック
         try:
             # テキストで検索
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(Timeouts.MEDIUM)
 
             # ページのテキストを取得してデバッグ
             body_text = await page.evaluate("document.body.innerText")
@@ -197,7 +200,7 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
                 # 空のリストを返す（エラーにはしない）
                 return []
 
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(Timeouts.NAVIGATION)
 
             # 「投票内容照会（当日分/前日分）」を選択
             if date_type == "same_day":
@@ -221,7 +224,7 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
                         await button.click()
                         break
 
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(Timeouts.NAVIGATION)
 
             # テーブルからデータを抽出
             # IPATのテーブル構造に応じて調整が必要
@@ -264,11 +267,11 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
 
                     # 詳細ビューを開く
                     await link.click()
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(Timeouts.MEDIUM)
 
                     # 詳細ビューが完全に表示されるまで待つ
                     try:
-                        await page.wait_for_selector('.bet-refer-result', state='visible', timeout=5000)
+                        await page.wait_for_selector('.bet-refer-result', state='visible', timeout=Timeouts.SELECTOR_WAIT)
                     except:
                         logger.warning("   ⚠️ Detail view not fully loaded")
 
@@ -357,14 +360,14 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
                     back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
                     if back_button:
                         await back_button.click()
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(Timeouts.SHORT)
                     else:
                         logger.warning("⚠️ Could not find back button, trying close button")
                         # フォールバック: 閉じるボタンを試す（これは全体を閉じる可能性あり）
                         close_button = await page.query_selector('button[ng-click="vm.close()"]')
                         if close_button:
                             await close_button.click()
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(Timeouts.SHORT)
 
                 except Exception as e:
                     logger.warning(f"Failed to parse receipt {idx+1}: {e}")
@@ -373,12 +376,12 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
                         back_button = await page.query_selector('button[ng-click="vm.closeBetReferDetail()"]')
                         if back_button:
                             await back_button.click()
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(Timeouts.SHORT)
                         else:
                             close_button = await page.query_selector('button[ng-click="vm.close()"]')
                             if close_button:
                                 await close_button.click()
-                                await page.wait_for_timeout(1000)
+                                await page.wait_for_timeout(Timeouts.SHORT)
                     except:
                         pass
                     continue
@@ -387,7 +390,7 @@ async def fetch_existing_bets(page: Page, date_type: str = "same_day") -> List[E
 
             # メインページに戻る
             await page.goto(IPAT_HOME_URL)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(Timeouts.MEDIUM)
 
             return existing_bets
 
@@ -518,7 +521,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
             logger.error("❌ '入出金' button not found")
             return False
 
-        await deposit_page.wait_for_timeout(4000)
+        await deposit_page.wait_for_timeout(Timeouts.LONG)
         logger.info(f"✓ Deposit window opened: {deposit_page.url}")
 
         # "入金指示"リンクをクリック
@@ -537,7 +540,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
             await deposit_page.close()
             return False
 
-        await deposit_page.wait_for_timeout(4000)
+        await deposit_page.wait_for_timeout(Timeouts.LONG)
 
         # 金額を入力
         await deposit_page.fill('input[name="NYUKIN"]', str(deposit_amount))
@@ -560,7 +563,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
             await deposit_page.close()
             return False
 
-        await deposit_page.wait_for_timeout(4000)
+        await deposit_page.wait_for_timeout(Timeouts.LONG)
 
         # パスワード（暗証番号）を入力
         await deposit_page.fill('input[name="PASS_WORD"]', credentials['password'])
@@ -678,7 +681,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
             # フォーム送信後のナビゲーションを待つ
             logger.info("⏳ Waiting for navigation after form submission...")
             try:
-                await deposit_page.wait_for_load_state('networkidle', timeout=10000)
+                await deposit_page.wait_for_load_state('networkidle', timeout=Timeouts.NETWORKIDLE)
                 logger.info("✓ Navigation completed")
             except Exception as nav_error:
                 logger.warning(f"⚠️ Navigation timeout (might be expected): {nav_error}")
@@ -688,17 +691,17 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
             await deposit_page.close()
             return False
 
-        await deposit_page.wait_for_timeout(4000)
+        await deposit_page.wait_for_timeout(Timeouts.LONG)
 
         # アラートを承認
         try:
             deposit_page.on('dialog', lambda dialog: dialog.accept())
-            await deposit_page.wait_for_timeout(2000)
+            await deposit_page.wait_for_timeout(Timeouts.MEDIUM)
             logger.info("✓ Alert accepted")
         except Exception as e:
             logger.debug(f"No alert or already handled: {e}")
 
-        await deposit_page.wait_for_timeout(4000)
+        await deposit_page.wait_for_timeout(Timeouts.LONG)
         await take_screenshot(deposit_page, "deposit_complete")
 
         # 入金ウィンドウを閉じる
@@ -733,7 +736,7 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
                 if attempt < max_retries:
                     logger.info(f"🔄 Waiting 30 seconds before next check... ({attempt}/{max_retries})")
                     # 次のチェックまで30秒待機
-                    await page.wait_for_timeout(30000)
+                    await page.wait_for_timeout(Timeouts.BALANCE_CHECK)
 
         # 最終確認
         if balance < deposit_amount:
@@ -761,7 +764,7 @@ async def login_simple(page: Page, credentials: dict):
 
         # ログイン画面の表示（PC版 - 2段階ログイン）
         await page.goto(IPAT_URL)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
 
         # ========== 第1段階: INET-ID入力 ==========
         logger.info("🔐 Stage 1: INET-ID login")
@@ -770,7 +773,7 @@ async def login_simple(page: Page, credentials: dict):
 
         # 次の画面への遷移
         await page.click('.button')
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
         logger.info("✓ Stage 1 button clicked")
         await take_screenshot(page, "after_stage1")
 
@@ -789,14 +792,14 @@ async def login_simple(page: Page, credentials: dict):
         await page.fill('input[name="r"]', credentials['pars'])
         logger.info("✓ P-ARS entered")
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
         # 次の画面への遷移 - .buttonModernをクリック
-        button_modern = await page.wait_for_selector('.buttonModern', timeout=5000)
+        button_modern = await page.wait_for_selector('.buttonModern', timeout=Timeouts.SELECTOR_WAIT)
         logger.info("✓ Found .buttonModern element")
 
         await button_modern.click(force=True)
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(Timeouts.LOGIN)
         logger.info(f"✓ Stage 2 button clicked, current URL: {page.url}")
 
         # エラーメッセージの確認
@@ -813,20 +816,20 @@ async def login_simple(page: Page, credentials: dict):
 
         # お知らせなどの確認画面の判定(OKがあればOKをクリック)
         try:
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(Timeouts.LONG)
             buttons = await page.query_selector_all('button')
             for button in buttons:
                 text = await button.text_content()
                 if text and "OK" in text:
                     await button.click()
                     logger.info("✓ OK button clicked")
-                    await page.wait_for_timeout(4000)
+                    await page.wait_for_timeout(Timeouts.LONG)
                     break
         except Exception as e:
             logger.debug(f"No OK button found (normal): {e}")
 
         # メインフレームの読み込みを待つ
-        await page.wait_for_timeout(6000)
+        await page.wait_for_timeout(Timeouts.VERY_LONG)
 
         # ログイン成功/失敗の判定
         page_text = await page.evaluate("document.body.innerText")
@@ -866,7 +869,7 @@ async def login_simple(page: Page, credentials: dict):
             main_frame = page
         else:
             # メインフレームに切り替わるまで待つ
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(Timeouts.NAVIGATION)
 
         # 残高確認（メインフレーム内で）
         # まずページ全体のHTMLを保存してデバッグ
@@ -922,9 +925,9 @@ async def login_simple(page: Page, credentials: dict):
             if balance is not None:
                 break
             logger.info(f"Waiting for balance... ({i+1}/{max_retries})")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(Timeouts.NAVIGATION)
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, "login_complete")
         logger.info("✅ Login completed successfully")
         return True
@@ -941,7 +944,7 @@ async def navigate_to_vote_simple(page: Page):
         logger.info("📋 Navigating to vote page...")
 
         # ページが完全に読み込まれるまで待つ
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, "before_vote_navigation")
 
         # ページのHTMLをデバッグ出力
@@ -973,7 +976,7 @@ async def navigate_to_vote_simple(page: Page):
                         if text and ("OK" in text or "閉じる" in text):
                             await btn.click()
                             logger.info(f"✓ Clicked close button: {text.strip()}")
-                            await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(Timeouts.SHORT)
                             break
                 except:
                     pass
@@ -986,13 +989,13 @@ async def navigate_to_vote_simple(page: Page):
                 if text and "投票メニュー" in text:
                     logger.info("✓ Clicking '投票メニュー' link to reset vote page")
                     await link.click()
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(Timeouts.MEDIUM)
                     # ここから通常投票ボタンを探す
                     break
             except:
                 pass
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
         # すべてのボタンをデバッグ出力
         buttons = await page.query_selector_all('button')
@@ -1013,7 +1016,7 @@ async def navigate_to_vote_simple(page: Page):
                     logger.warning(f"JS click failed, trying normal click: {e}")
                     await button.click()
                     logger.info(f"✓ Clicked vote button: {text.strip()}")
-                await page.wait_for_timeout(4000)
+                await page.wait_for_timeout(Timeouts.LONG)
 
                 # 投票ボタンクリック後にモーダルが出る場合があるので再度チェック
                 try:
@@ -1028,7 +1031,7 @@ async def navigate_to_vote_simple(page: Page):
                                     if mtext and ("このまま進む" in mtext or "OK" in mtext or "進む" in mtext):
                                         await mbtn.click()
                                         logger.info(f"✓ Closed post-vote modal: {mtext.strip()}")
-                                        await page.wait_for_timeout(2000)
+                                        await page.wait_for_timeout(Timeouts.MEDIUM)
                                         break
                                 except:
                                     pass
@@ -1057,7 +1060,7 @@ async def navigate_to_vote_simple(page: Page):
                             logger.warning(f"JS click failed in frame {i}, trying normal click: {e}")
                             await button.click()
                             logger.info(f"✓ Clicked vote button in frame {i}: {text.strip()}")
-                        await page.wait_for_timeout(4000)
+                        await page.wait_for_timeout(Timeouts.LONG)
                         await take_screenshot(page, "vote_page")
                         return True
             except Exception as e:
@@ -1112,7 +1115,7 @@ async def select_race_simple(page: Page, racecourse: str, race_number: int):
 
         # Angularがレース一覧を読み込むまで待つ
         logger.info("Waiting for race list to load...")
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, f"after_racecourse_selection_{racecourse}")
 
         # レースの選択 - buttons と clickable elements の両方を検索
@@ -1165,13 +1168,13 @@ async def select_race_simple(page: Page, racecourse: str, race_number: int):
         except Exception as e:
             logger.warning(f"Error waiting for 'on' class: {e}")
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, f"race_selected_{racecourse}_{race_number}")
 
         # 馬番が表示される領域までスクロール
         logger.info("Scrolling to horse selection area...")
         await page.evaluate("window.scrollTo(0, 400);")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
         await take_screenshot(page, f"horse_selection_{racecourse}_{race_number}")
         return True
@@ -1193,16 +1196,16 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
             await take_screenshot(page, f"insufficient_balance_{horse_number}")
             return False
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
 
         # スクロール（大きい番号の場合）
         if horse_number >= 9:
             logger.info("Scrolling for larger horse numbers...")
             await page.evaluate("window.scrollTo(0, 300);")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(Timeouts.MEDIUM)
             if horse_number >= 13:
                 await page.evaluate("window.scrollTo(0, 300);")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(Timeouts.MEDIUM)
 
         # 馬番から買う馬券を選択
         # デバッグ: HTMLとlabelの情報を保存
@@ -1238,12 +1241,12 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
         if not found:
             # フォールバック: 旧方式
             if len(labels) > horse_number + 8:
-                await labels[horse_number + 8].click()
+                await labels[horse_number + UIIndices.HORSE_LABEL_OFFSET].click()
                 logger.info(f"✓ Horse #{horse_number} selected (fallback method)")
             else:
                 raise Exception(f"Not enough labels found: {len(labels)} < {horse_number + 8}")
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
         # セットのクリック
         buttons = await page.query_selector_all('button')
@@ -1254,7 +1257,7 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
                 logger.info("✓ 'Set' button clicked")
                 break
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
         # 入力終了のクリック
         buttons = await page.query_selector_all('button')
@@ -1265,21 +1268,21 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
                 logger.info("✓ 'Input End' button clicked")
                 break
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
         await take_screenshot(page, "before_amount_input")
 
         # 購入直前の投票票数の入力
         inputs = await page.query_selector_all('input')
         bet_units = bet_amount // 100
 
-        await inputs[9].fill(str(bet_units))
-        await page.wait_for_timeout(1000)
-        await inputs[10].fill(str(bet_units))
-        await page.wait_for_timeout(1000)
-        await inputs[11].fill(str(bet_amount))
+        await inputs[UIIndices.BET_UNITS_INPUT_1].fill(str(bet_units))
+        await page.wait_for_timeout(Timeouts.SHORT)
+        await inputs[UIIndices.BET_UNITS_INPUT_2].fill(str(bet_units))
+        await page.wait_for_timeout(Timeouts.SHORT)
+        await inputs[UIIndices.BET_AMOUNT_INPUT].fill(str(bet_amount))
         logger.info(f"✓ Bet amount entered: {bet_amount} yen")
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
         await take_screenshot(page, "before_purchase")
 
         # 購入ボタン
@@ -1291,7 +1294,7 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
                 logger.info("✓ 'Purchase' button clicked")
                 break
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(Timeouts.LONG)
 
         # ダイアログのメッセージを確認
         page_text = await page.text_content('body')
@@ -1355,7 +1358,7 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
         logger.info(f"✅ Bet added to cart: {horse_name} - {bet_amount} yen")
 
         # 実際の「購入」処理を実行
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
         await take_screenshot(page, "after_set")
 
         # 購入予定リストから「投票内容確認」ボタンを探してクリック
@@ -1394,7 +1397,7 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
             return False
 
         # 確認画面が表示されるまで待つ
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, "purchase_confirmation_screen")
 
         # 確認画面で「購入する」ボタンを探してクリック
@@ -1423,7 +1426,7 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
             return False
 
         # 購入確認ダイアログの処理
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, "final_purchase_confirmation")
 
         # 購入完了のメッセージを確認
@@ -1533,7 +1536,7 @@ async def main():
             else:
                 # セッションを使う場合でも、ログイン状態を確認
                 await page.goto(IPAT_URL)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(Timeouts.NAVIGATION)
                 page_text = await page.evaluate("document.body.innerText")
 
                 # ログインフォームが表示されている場合はセッション期限切れ
@@ -1670,7 +1673,7 @@ async def main():
                     if ticket_idx > 0:
                         logger.info("🔄 Returning to top page...")
                         await page.goto(IPAT_HOME_URL)
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_timeout(Timeouts.NAVIGATION)
                         logger.info("✓ Returned to top page")
 
                     # 投票画面へ移動
