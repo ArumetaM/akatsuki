@@ -1761,6 +1761,13 @@ async def confirm_and_purchase_bet(page: Page) -> bool:
         await page.wait_for_timeout(Timeouts.NAVIGATION)
         await take_screenshot(page, "purchase_confirmation_screen")
 
+        # すでに購入完了しているかチェック（受付番号が表示されている場合）
+        page_text = await page.text_content('body') or ''
+        if '受付番号' in page_text and '購入しました' not in page_text:
+            # 受付番号が表示されていれば、自動的に購入が完了している
+            logger.info("✅ Purchase already completed (受付番号 detected on screen)")
+            return True
+
         # 確認画面で「購入する」ボタンを探してクリック
         logger.info("💳 Looking for final purchase button on confirmation screen...")
 
@@ -1770,14 +1777,20 @@ async def confirm_and_purchase_bet(page: Page) -> bool:
         for btn in final_buttons:
             try:
                 text = await btn.text_content()
-                if text and "購入" in text.strip() and len(text.strip()) < 10:
-                    # ボタンが表示されているか確認
-                    if await btn.is_visible():
-                        # JavaScriptクリックを使用
-                        await btn.evaluate("el => el.click()")
-                        logger.info(f"✓ Final purchase button clicked: {text.strip()}")
-                        final_purchase_clicked = True
-                        break
+                if text:
+                    normalized_text = text.replace('\n', '').replace(' ', '').replace('\t', '').strip()
+                    # "購入する" を検索（改行・スペース対応）
+                    if "購入する" in normalized_text:
+                        # ボタンが表示されているか確認
+                        if await btn.is_visible():
+                            # JavaScriptクリックを使用
+                            await btn.evaluate("el => el.click()")
+                            logger.info(f"✓ Final purchase button clicked: {normalized_text}")
+                            final_purchase_clicked = True
+                            # 購入完了画面への遷移を待つ
+                            await page.wait_for_timeout(Timeouts.NAVIGATION)
+                            await take_screenshot(page, "after_final_purchase_click")
+                            break
             except:
                 pass
 
