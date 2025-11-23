@@ -812,7 +812,7 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
         deposit_amount: 入金額
 
     Returns:
-        残高確認成功したらTrue（タイムアウトでもTrueを返す）
+        残高が入金額以上になったらTrue、タイムアウトや失敗時はFalse
     """
     try:
         # メインページで残高が更新されるまで待つ（最大3回、各30秒 = 最大90秒）
@@ -848,13 +848,12 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
 
         # 最終確認
         if balance < deposit_amount:
-            logger.warning(f"⚠️ Balance verification timed out after {max_retries} attempts")
-            logger.warning(f"   Expected: {deposit_amount:,}円, Got: {balance:,}円")
-            logger.warning("⚠️ This may be normal if funds are reserved in cart from previous operations")
-            logger.info("✅ Deposit was submitted successfully - proceeding with purchase anyway")
+            logger.error(f"❌ Balance verification timed out after {max_retries} attempts")
+            logger.error(f"   Expected: {deposit_amount:,}円, Got: {balance:,}円")
+            logger.error("❌ 入金が反映されませんでした。銀行口座の残高不足の可能性があります。")
+            logger.error("❌ 投票処理を中止します。")
             await take_screenshot(page, "deposit_verification_timeout")
-            # Continue anyway since deposit was submitted
-            return True
+            return False
 
         logger.info(f"✅ Deposit completed and verified: {balance:,}円")
         return True
@@ -862,8 +861,7 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
     except Exception as e:
         logger.error(f"❌ Failed to verify deposit balance: {e}")
         await take_screenshot(page, "deposit_verification_error")
-        # Return True anyway to continue with purchase
-        return True
+        return False
 
 
 async def deposit(page: Page, credentials: dict, amount: int = 20000):
