@@ -237,22 +237,28 @@ def save_tickets_csv(tickets: List[Dict[str, Any]], output_path: str) -> None:
     logger.info(f"Saved {len(tickets)} tickets to {output_path}")
 
 
-async def run_purchase_bot(tickets_path: str, dry_run: bool = True) -> Dict[str, Any]:
+async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date: str = None) -> Dict[str, Any]:
     """
     購入Botを実行
 
     Args:
         tickets_path: チケットCSVのパス
         dry_run: DRY_RUNモード
+        target_date: 対象日（YYYYMMDD形式）
 
     Returns:
         購入結果の辞書
     """
     from playwright.async_api import async_playwright
 
+    # target_dateがない場合は当日
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y%m%d')
+
     # 環境変数設定
     os.environ['DRY_RUN'] = 'true' if dry_run else 'false'
     os.environ['TICKETS_PATH'] = tickets_path
+    os.environ['TARGET_DATE'] = target_date
 
     # bot_simple.pyの関数をインポート
     try:
@@ -310,10 +316,10 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True) -> Dict[str,
             if not await login_simple(page, credentials):
                 raise Exception("IPAT login failed")
 
-            # チケット読み込みと突合（Pathオブジェクトとして渡す）
+            # チケット読み込みと突合（S3 + IPAT履歴チェック）
             from pathlib import Path
             tickets, reconciliation_results, to_purchase = await load_and_reconcile_tickets(
-                page, Path(tickets_path)
+                page, Path(tickets_path), target_date
             )
 
             results['tickets_total'] = len(tickets)
@@ -340,8 +346,8 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True) -> Dict[str,
             if not await ensure_sufficient_balance(page, credentials, to_purchase):
                 raise Exception("Insufficient balance and deposit failed")
 
-            # 購入実行
-            await process_tickets(page, to_purchase)
+            # 購入実行（成功時にS3に記録）
+            await process_tickets(page, to_purchase, target_date)
 
             results['status'] = 'success'
             results['tickets_purchased'] = len(to_purchase)
@@ -447,7 +453,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # 購入Bot実行
         results = asyncio.get_event_loop().run_until_complete(
-            run_purchase_bot(tickets_path, dry_run)
+            run_purchase_bot(tickets_path, dry_run, target_date)
         )
 
         # 結果をS3にアップロード

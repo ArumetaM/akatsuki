@@ -23,6 +23,15 @@ from constants import Timeouts, UIIndices, URLs, Config
 # ユーティリティのインポート
 from page_navigator import PageNavigator
 
+# S3購入履歴サービス（冪等性確保）
+try:
+    from services.purchase_history import PurchaseHistoryService
+except ImportError:
+    # Lambda環境からのインポート対応
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from services.purchase_history import PurchaseHistoryService
+
 # 環境変数読み込み
 load_dotenv()
 
@@ -1989,14 +1998,23 @@ async def initialize_browser_and_session(p, credentials):
     return browser, context, page
 
 
-async def load_and_reconcile_tickets(page: Page, tickets_path: Path):
+async def load_and_reconcile_tickets(page: Page, tickets_path: Path, target_date: Optional[str] = None):
     """
     チケットCSVを読み込み、既存投票と突合
+
+    Args:
+        page: Playwright page
+        tickets_path: チケットCSVのパス
+        target_date: 対象日（YYYYMMDD形式、Noneの場合は当日）
 
     Returns:
         Tuple[List[Ticket], List[ReconciliationResult], List[Ticket]]:
         (tickets, reconciliation_results, to_purchase)
     """
+    # target_dateがない場合は当日を使用
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y%m%d')
+
     # CSVを読み込む
     tickets_df = pd.read_csv(tickets_path)
     logger.info(f"📄 Found {len(tickets_df)} tickets to process from {tickets_path.name}")
@@ -2016,11 +2034,42 @@ async def load_and_reconcile_tickets(page: Page, tickets_path: Path):
 
     logger.info(f"📄 Loaded {len(tickets)} tickets from CSV")
 
-    # 既存の投票を取得（冪等性チェック）
+    # Step 1: S3購入履歴チェック（最優先）
+    s3_skipped = []
+    s3_to_check = []
+    try:
+        history_service = PurchaseHistoryService()
+        for ticket in tickets:
+            if history_service.is_already_purchased(ticket, target_date):
+                s3_skipped.append(ticket)
+                logger.info(f"✓ SKIP (S3 history): {ticket}")
+            else:
+                s3_to_check.append(ticket)
+
+        if s3_skipped:
+            logger.info(f"📋 S3 history check: {len(s3_skipped)} already purchased, {len(s3_to_check)} to verify with IPAT")
+    except Exception as e:
+        logger.warning(f"⚠️ S3 history check failed, falling back to IPAT only: {e}")
+        s3_to_check = tickets
+        s3_skipped = []
+
+    # Step 2: 既存の投票を取得（IPAT投票履歴チェック - バックアップ）
     existing_bets = await fetch_existing_bets(page, date_type="same_day")
 
-    # 突合処理
-    reconciliation_results = reconcile_tickets(tickets, existing_bets)
+    # 突合処理（S3でスキップされなかったチケットのみ）
+    reconciliation_results = []
+
+    # S3でスキップされたチケットを結果に追加
+    for ticket in s3_skipped:
+        reconciliation_results.append(ReconciliationResult(
+            ticket=ticket,
+            status=TicketStatus.ALREADY_PURCHASED,
+            existing_bet=None  # S3履歴からの判定
+        ))
+
+    # 残りのチケットをIPAT履歴と突合
+    ipat_results = reconcile_tickets(s3_to_check, existing_bets)
+    reconciliation_results.extend(ipat_results)
 
     # 未購入のチケットのみを抽出
     to_purchase = [
@@ -2035,10 +2084,11 @@ async def load_and_reconcile_tickets(page: Page, tickets_path: Path):
     )
 
     logger.info("\n" + "=" * 60)
-    logger.info("RECONCILIATION SUMMARY")
+    logger.info("RECONCILIATION SUMMARY (S3 + IPAT)")
     logger.info("=" * 60)
     logger.info(f"Total tickets: {len(tickets)}")
-    logger.info(f"Already purchased: {already_purchased_count}")
+    logger.info(f"Already purchased (S3): {len(s3_skipped)}")
+    logger.info(f"Already purchased (IPAT): {already_purchased_count - len(s3_skipped)}")
     logger.info(f"To purchase: {len(to_purchase)}")
     logger.info("=" * 60)
 
@@ -2121,14 +2171,26 @@ async def ensure_sufficient_balance(page: Page, credentials: dict, to_purchase: 
         return True
 
 
-async def process_tickets(page: Page, to_purchase: List[Ticket]):
+async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Optional[str] = None):
     """
     未購入チケットを処理
 
     Args:
         page: Playwright page
         to_purchase: 購入すべきチケットのリスト
+        target_date: 対象日（YYYYMMDD形式、Noneの場合は当日）
     """
+    # target_dateがない場合は当日を使用
+    if target_date is None:
+        target_date = datetime.now().strftime('%Y%m%d')
+
+    # S3履歴サービス（購入成功時に記録）
+    history_service = None
+    try:
+        history_service = PurchaseHistoryService()
+    except Exception as e:
+        logger.warning(f"⚠️ S3 history service initialization failed: {e}")
+
     for ticket_idx, ticket in enumerate(to_purchase):
         try:
             logger.info(f"\n{'='*60}")
@@ -2145,24 +2207,35 @@ async def process_tickets(page: Page, to_purchase: List[Ticket]):
             # 投票画面へ移動
             if not await navigate_to_vote_simple(page):
                 logger.error("Failed to navigate to vote page")
+                if history_service:
+                    history_service.record_purchase_error(ticket, target_date, "Failed to navigate to vote page")
                 continue
 
             # レース選択
             if not await select_race_simple(page, ticket.racecourse, ticket.race_number):
                 logger.error("Failed to select race")
+                if history_service:
+                    history_service.record_purchase_error(ticket, target_date, "Failed to select race")
                 continue
 
             # 馬選択と投票
             if await select_horse_and_bet_simple(page, ticket.horse_number, ticket.horse_name, ticket.amount):
                 logger.info(f"✅ Ticket {ticket_idx+1} completed successfully")
+                # 購入成功をS3に即時記録（クラッシュ前に永続化）
+                if history_service:
+                    history_service.record_purchase(ticket, target_date)
             else:
                 logger.error(f"❌ Ticket {ticket_idx+1} failed")
+                if history_service:
+                    history_service.record_purchase_error(ticket, target_date, "select_horse_and_bet_simple returned False")
 
             # 次のチケットのため少し待機
             await page.wait_for_timeout(5000)
 
         except Exception as e:
             logger.error(f"Error processing ticket {ticket_idx+1}: {e}")
+            if history_service:
+                history_service.record_purchase_error(ticket, target_date, str(e))
             continue
 
     logger.info("\n🏁 All unpurchased tickets processed")
@@ -2176,6 +2249,10 @@ async def main():
         # 1. 設定を読み込む
         credentials, slack_info, tickets_path = await load_configuration()
 
+        # target_dateを設定（環境変数または当日）
+        target_date = os.environ.get('TARGET_DATE', datetime.now().strftime('%Y%m%d'))
+        logger.info(f"📅 Target date: {target_date}")
+
         # 2. ブラウザとセッションを初期化
         async with async_playwright() as p:
             browser, context, page = await initialize_browser_and_session(p, credentials)
@@ -2187,8 +2264,8 @@ async def main():
                 logger.warning("🔸 DRY_RUN MODE ENABLED")
                 logger.warning("=" * 60)
 
-            # 3. チケット読み込みと突合
-            tickets, reconciliation_results, to_purchase = await load_and_reconcile_tickets(page, tickets_path)
+            # 3. チケット読み込みと突合（S3 + IPAT履歴チェック）
+            tickets, reconciliation_results, to_purchase = await load_and_reconcile_tickets(page, tickets_path, target_date)
 
             # 全てのチケットが既に購入済みの場合
             if len(to_purchase) == 0:
@@ -2208,8 +2285,8 @@ async def main():
                 await browser.close()
                 return
 
-            # 6. チケット処理
-            await process_tickets(page, to_purchase)
+            # 6. チケット処理（購入成功時にS3に記録）
+            await process_tickets(page, to_purchase, target_date)
 
             await browser.close()
 
