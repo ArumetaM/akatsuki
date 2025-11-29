@@ -33,7 +33,8 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     "numpy<2.0" \
     playwright==1.44.0 \
-    awslambdaric
+    awslambdaric \
+    requests
 
 # Playwrightブラウザはベースイメージに含まれている
 # 追加インストール不要
@@ -41,6 +42,7 @@ RUN pip install --no-cache-dir \
 # アプリケーションコードをコピー
 COPY scripts/ ./scripts/
 COPY lambda/purchase_handler.py ./
+COPY lambda/slack_service.py ./
 
 # Lambda実行ユーザー(sbx_user1051)が読み取れるようパーミッションを修正
 # 755 for directories, 644 for files
