@@ -26,15 +26,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Python依存関係のインストール
 COPY lambda/requirements.txt ./
-RUN pip install --no-cache-dir \
-    boto3 \
-    pandas \
-    aiohttp \
-    python-dotenv \
-    "numpy<2.0" \
-    playwright==1.44.0 \
-    awslambdaric \
-    requests
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir awslambdaric
 
 # Playwrightブラウザはベースイメージに含まれている
 # 追加インストール不要
