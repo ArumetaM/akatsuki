@@ -14,5 +14,8 @@ numpy<2.0  # Lambda環境でのGCCビルド回避
 # 非同期処理
 aiohttp>=3.9.0
 
+# HTTP通信（Slack API用）
+requests>=2.28.0
+
 # 環境変数（ローカル実行時のみ使用）
 python-dotenv>=1.0.0

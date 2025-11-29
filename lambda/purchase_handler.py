@@ -33,6 +33,20 @@ import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
+from slack_service import SlackService
+
+# Slack通知サービス（遅延初期化）
+_slack_service = None
+
+
+def get_slack_service() -> SlackService:
+    """SlackServiceのシングルトン取得"""
+    global _slack_service
+    if _slack_service is None:
+        _slack_service = SlackService()
+    return _slack_service
+
+
 # Lambda環境用の設定
 # HOME=/tmp と PLAYWRIGHT_BROWSERS_PATH=/ms-playwright は Dockerfile で設定済み
 # os.environ設定による上書きを避けるためコード側での設定は行わない
@@ -380,6 +394,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     logger.info(f"Lambda handler started: {json.dumps(event)}")
 
+    # Slack通知サービス取得
+    slack = get_slack_service()
+    target_date = 'unknown'
+
     try:
         # 設定取得
         target_date = get_target_date(event)
@@ -403,6 +421,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         inference_df = s3_client.download_inference_results(source_bucket, target_date)
 
         if inference_df is None or len(inference_df) == 0:
+            # 購入候補なし通知
+            slack.send_no_bets(target_date)
             return {
                 'statusCode': 200,
                 'body': {
@@ -417,6 +437,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # チケット形式に変換
         tickets = convert_inference_to_tickets(inference_df, bet_amount)
+
+        # 開始通知
+        slack.send_purchase_start(target_date, len(tickets), dry_run)
 
         # 一時ファイルにCSV保存
         tickets_path = '/tmp/tickets.csv'
@@ -435,6 +458,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         result_key = s3_client.upload_results(output_bucket, target_date, results)
         results['result_s3_key'] = result_key
 
+        # 完了通知
+        purchased = results.get('tickets_purchased', 0) or results.get('tickets_to_purchase', 0)
+        skipped = results.get('tickets_skipped', 0)
+        total_cost = results.get('total_cost', purchased * bet_amount)
+        slack.send_purchase_complete(target_date, purchased, skipped, total_cost, dry_run)
+
         return {
             'statusCode': 200,
             'body': results
@@ -442,6 +471,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"Lambda handler error: {e}")
+        # エラー通知
+        slack.send_error(target_date, str(e))
         return {
             'statusCode': 500,
             'body': {
