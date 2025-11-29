@@ -833,6 +833,16 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
             except Exception as e:
                 logger.warning(f"Failed to save HTML: {e}")
 
+            # 入金反映には時間がかかるため、最初に60秒待機
+            if attempt == 1:
+                logger.info("⏳ Waiting 60 seconds for deposit to reflect...")
+                await page.wait_for_timeout(60000)  # 60秒待機
+
+            # ページをリロードして最新の残高を取得
+            logger.info("🔄 Reloading page to get latest balance...")
+            await page.reload()
+            await page.wait_for_timeout(3000)  # リロード後の安定待ち
+
             # 残高を確認
             balance = await get_current_balance(page)
 

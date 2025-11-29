@@ -11,6 +11,7 @@ services:
       - ./tickets:/app/tickets
       - ./output:/app/output
       - ./logs:/app/logs
+      - ./scripts:/app/scripts
     environment:
       - PYTHONUNBUFFERED=1
     networks:
