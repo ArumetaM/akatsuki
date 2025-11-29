@@ -1836,14 +1836,21 @@ async def verify_purchase_completion(page: Page, horse_name: str, bet_amount: in
             logger.info(f"✅ Purchase completed successfully: {horse_name} - {bet_amount} yen")
             await take_screenshot(page, "purchase_complete_success")
 
-            # 完了ダイアログのOKをクリック
-            final_buttons = await page.query_selector_all('button')
-            for btn in final_buttons:
-                text = await btn.text_content()
-                if text and text.strip() == "OK":
-                    await btn.click()
-                    logger.info("✓ Purchase completion dialog closed")
-                    break
+            # 完了ダイアログのOKをクリック（失敗しても購入は成功しているので無視）
+            try:
+                final_buttons = await page.query_selector_all('button')
+                for btn in final_buttons:
+                    text = await btn.text_content()
+                    if text and text.strip() == "OK":
+                        if await btn.is_visible():
+                            try:
+                                await btn.click(timeout=5000)
+                                logger.info("✓ Purchase completion dialog closed")
+                            except Exception as click_err:
+                                logger.warning(f"⚠️ OK button click failed (ignored): {click_err}")
+                        break
+            except Exception as dialog_err:
+                logger.warning(f"⚠️ Dialog close failed (ignored): {dialog_err}")
 
             return True
         else:
