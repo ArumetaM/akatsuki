@@ -1,0 +1,18 @@
+# akatsuki Lambda依存関係
+# Playwright + AWS SDK + データ処理
+
+# Playwright (ヘッドレスブラウザ自動化)
+playwright==1.44.0
+
+# AWS SDK
+boto3>=1.34.0
+
+# データ処理
+pandas>=2.0.0
+numpy<2.0  # Lambda環境でのGCCビルド回避
+
+# 非同期処理
+aiohttp>=3.9.0
+
+# 環境変数（ローカル実行時のみ使用）
+python-dotenv>=1.0.0
