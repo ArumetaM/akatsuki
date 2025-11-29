@@ -1,0 +1,26 @@
+# akatsuki Evaluator Lambda用 Dockerfile
+# 購入結果評価機能（軽量版）- Playwrightなし
+#
+# 使用方法:
+#   docker build -t akatsuki-evaluator:latest -f lambda/Dockerfile.evaluator .
+#   docker push xxxx.dkr.ecr.ap-northeast-1.amazonaws.com/akatsuki-evaluator:latest
+#
+# Playwrightが不要なため、AWS公式Lambda Pythonイメージを使用
+# 購入版より大幅に軽量（~100MB vs ~1.5GB）
+
+FROM public.ecr.aws/lambda/python:3.11
+
+# 必要なPythonパッケージのみインストール
+# Playwright/Chromiumは不要
+COPY lambda/requirements.evaluator.txt ./
+RUN pip install --no-cache-dir -r requirements.evaluator.txt
+
+# アプリケーションコードをコピー
+COPY lambda/evaluator_handler.py ./
+COPY lambda/slack_service.py ./
+
+# Lambda実行ユーザーが読み取れるようパーミッションを修正
+RUN chmod 644 *.py
+
+# Lambda関数のエントリーポイント
+CMD ["evaluator_handler.handler"]
