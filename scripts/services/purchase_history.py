@@ -225,6 +225,32 @@ class PurchaseHistoryService:
 
         logger.warning(f"Recorded purchase error: {ticket.racecourse} {ticket.race_number}R {ticket.horse_number}番 - {error_message}")
 
+    def record_unverified_purchase(self, ticket: Any, target_date: str) -> None:
+        """
+        購入未確認を記録（画面成功だが照会未確認）
+
+        Args:
+            ticket: 購入を試みたTicketオブジェクト
+            target_date: 対象日（YYYYMMDD形式）
+        """
+        history = self.load_history(target_date)
+
+        record = {
+            "race_course": ticket.racecourse,
+            "race_number": ticket.race_number,
+            "horse_number": ticket.horse_number,
+            "bet_type": ticket.bet_type,
+            "amount": ticket.amount,
+            "status": "UNVERIFIED",
+            "purchased_at": datetime.now(timezone.utc).isoformat(),
+            "note": "Screen showed success but inquiry verification failed"
+        }
+
+        history["tickets"].append(record)
+        self.save_history(target_date, history)
+
+        logger.warning(f"Recorded unverified purchase: {ticket.racecourse} {ticket.race_number}R {ticket.horse_number}番 - inquiry verification failed")
+
     def get_purchase_summary(self, target_date: str) -> Dict[str, int]:
         """
         購入サマリーを取得

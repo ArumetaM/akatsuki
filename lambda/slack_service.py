@@ -141,6 +141,25 @@ class SlackService:
         msg += f"   :warning: 銀行口座への入金を確認してください"
         return self._send_message(self.alerts_channel or self.ops_channel, msg)
 
+    def send_purchase_verification_failed(
+        self,
+        target_date: str,
+        race_course: str,
+        race_number: int,
+        horse_number: int,
+        horse_name: str,
+        amount: int
+    ) -> bool:
+        """購入検証失敗通知（画面では成功したが照会で確認できなかった）"""
+        formatted_date = self._format_date(target_date)
+        msg = f":warning: 購入検証失敗: {formatted_date}\n"
+        msg += f"   {race_course} {race_number}R {horse_number}番 {horse_name}\n"
+        msg += f"   金額: ¥{amount:,}\n"
+        msg += f"   :exclamation: 画面上は成功表示でしたが、照会メニューで確認できませんでした\n"
+        msg += f"   手動でIPATを確認してください"
+
+        return self._send_message(self.alerts_channel or self.ops_channel, msg)
+
     def _format_date(self, date: str) -> str:
         """日付フォーマット（YYYYMMDD → YYYY/MM/DD）"""
         if len(date) == 8:
