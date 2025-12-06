@@ -24,11 +24,15 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
 
 from slack_service import SlackService
+from services.purchase_history import PurchaseHistoryService
 
 # ロギング設定
 logging.basicConfig(
@@ -132,15 +136,44 @@ class EvaluatorService:
             raise
 
     def evaluate_bets(self, inference_df: pd.DataFrame, results_df: pd.DataFrame,
-                      bet_amount: int = 5000) -> List[BetDetail]:
-        """購入馬券の評価"""
+                      target_date: str, bet_amount: int = 5000) -> List[BetDetail]:
+        """購入馬券の評価（実際に購入済みのもののみ）"""
         evaluated = []
+
+        # 購入履歴を取得
+        purchase_history = PurchaseHistoryService()
+        history = purchase_history.load_history(target_date)
+        purchased_tickets = history.get('tickets', [])
+
+        # 購入済みチケット（status=PURCHASED）のみをフィルタ
+        purchased_set = set()
+        for ticket in purchased_tickets:
+            if ticket.get('status') == 'PURCHASED':
+                key = (
+                    ticket.get('race_course'),
+                    ticket.get('race_number'),
+                    ticket.get('horse_number'),
+                    ticket.get('bet_type', '単勝')
+                )
+                purchased_set.add(key)
+
+        if not purchased_set:
+            logger.info(f"購入済みチケットなし（{target_date}）- 評価スキップ")
+            return evaluated
+
+        logger.info(f"購入済みチケット: {len(purchased_set)}件")
 
         for _, row in inference_df.iterrows():
             place_name = row['PlaceName']
             race_number = int(row['RaceNumber'])
             horse_number = int(row['HorseNumber'])
             horse_name = row.get('HorseName', '')
+
+            # 購入履歴に存在するかチェック
+            ticket_key = (place_name, race_number, horse_number, '単勝')
+            if ticket_key not in purchased_set:
+                logger.debug(f"未購入のためスキップ: {place_name} {race_number}R {horse_number}番")
+                continue
 
             # 場コード変換
             place_code = PLACE_CODE_MAP.get(place_name, '')
@@ -378,13 +411,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # 推論結果取得
         inference_df = service.get_inference_results(target_date)
         if inference_df is None or len(inference_df) == 0:
-            slack.send_no_data(target_date, "推論結果なし（購入なし）")
+            # 推論結果なし = 開催なし（平日など）
+            # → 通知せずに正常終了（ログのみ）
+            logger.info(f"No inference results for {target_date} (non-race day, skipping notification)")
             return {
                 'statusCode': 200,
                 'body': {
                     'status': 'no_inference',
                     'target_date': target_date,
-                    'message': 'No inference results found'
+                    'message': 'No inference results found (non-race day, no notification)'
                 }
             }
 
@@ -404,11 +439,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # 購入金額取得（環境変数 or デフォルト）
         bet_amount = int(os.environ.get('BET_AMOUNT', '5000'))
 
-        # 評価実行
-        details = service.evaluate_bets(inference_df, results_df, bet_amount)
+        # 評価実行（購入履歴に基づいて実際に購入したもののみ評価）
+        details = service.evaluate_bets(inference_df, results_df, target_date, bet_amount)
 
         if not details:
-            slack.send_no_data(target_date, "評価対象なし")
+            # 購入済みチケットなし = 評価対象なし（通知せずに正常終了）
+            logger.info(f"No purchased tickets for {target_date} - skipping notification")
             return {
                 'statusCode': 200,
                 'body': {
