@@ -248,7 +248,7 @@ def save_tickets_csv(tickets: List[Dict[str, Any]], output_path: str) -> None:
     logger.info(f"Saved {len(tickets)} tickets to {output_path}")
 
 
-async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date: str = None) -> Dict[str, Any]:
+async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date: str = None, slack_service=None) -> Dict[str, Any]:
     """
     購入Botを実行
 
@@ -256,6 +256,7 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date:
         tickets_path: チケットCSVのパス
         dry_run: DRY_RUNモード
         target_date: 対象日（YYYYMMDD形式）
+        slack_service: SlackService インスタンス（個別購入通知用）
 
     Returns:
         購入結果の辞書
@@ -356,8 +357,8 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date:
             # 残高確認と入金（失敗時はDepositFailedExceptionが投げられる）
             await ensure_sufficient_balance(page, credentials, to_purchase)
 
-            # 購入実行（成功時にS3に記録）
-            await process_tickets(page, to_purchase, target_date)
+            # 購入実行（成功時にS3に記録、個別通知をSlackに送信）
+            await process_tickets(page, to_purchase, target_date, slack_service)
 
             # S3履歴から結果を取得してUNVERIFIED件数をカウント
             try:
@@ -490,9 +491,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         tickets_path = '/tmp/tickets.csv'
         save_tickets_csv(tickets, tickets_path)
 
-        # 購入Bot実行
+        # 購入Bot実行（slack_serviceを渡して個別購入通知を送信）
         results = asyncio.get_event_loop().run_until_complete(
-            run_purchase_bot(tickets_path, dry_run, target_date)
+            run_purchase_bot(tickets_path, dry_run, target_date, slack)
         )
 
         # 結果をS3にアップロード
