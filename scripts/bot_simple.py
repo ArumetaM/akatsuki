@@ -557,6 +557,66 @@ def reconcile_tickets(
     return results
 
 
+async def verify_purchase_in_inquiry(
+    page: Page,
+    ticket: Ticket,
+    target_date: str
+) -> tuple:
+    """
+    購入後に照会メニューで実際の購入を確認
+
+    Args:
+        page: Playwright page
+        ticket: 確認対象のチケット
+        target_date: 対象日（YYYYMMDD形式）
+
+    Returns:
+        Tuple[bool, Optional[ExistingBet]]: (確認成功フラグ, 一致した既存投票)
+    """
+    try:
+        logger.info(f"🔍 Verifying purchase in inquiry menu: {ticket}")
+
+        # 少し待機（購入が照会に反映されるまで）
+        await page.wait_for_timeout(5000)
+
+        # PageNavigatorのインスタンス化
+        navigator = PageNavigator(page, logger)
+
+        # 投票履歴ページへ遷移
+        if not await navigate_to_bet_history_page(page, navigator, "same_day"):
+            logger.warning("⚠️ Failed to navigate to bet history page for verification")
+            return False, None
+
+        # 既存投票を取得
+        existing_bets = await fetch_existing_bets(page, "same_day")
+
+        # チケットと一致する投票を検索
+        for bet in existing_bets:
+            if (bet.racecourse == ticket.racecourse and
+                bet.race_number == ticket.race_number and
+                bet.horse_number == ticket.horse_number and
+                bet.amount == ticket.amount):
+                logger.info(f"✅ Purchase VERIFIED in inquiry: receipt={bet.receipt_number}")
+                return True, bet
+
+        logger.warning(f"⚠️ Purchase NOT FOUND in inquiry: {ticket}")
+        return False, None
+
+    except Exception as e:
+        logger.error(f"❌ Inquiry verification failed: {e}")
+        await take_screenshot(page, "inquiry_verification_error")
+        return False, None
+
+    finally:
+        # メインページに戻る（次のチケット処理のため）
+        try:
+            await page.goto(IPAT_HOME_URL)
+            await page.wait_for_timeout(Timeouts.MEDIUM)
+            logger.info("🔄 Returned to main page after verification")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to return to main page: {e}")
+
+
 async def get_current_balance(page: Page) -> int:
     """現在の購入限度額（残高）を取得"""
     try:
@@ -2270,17 +2330,30 @@ async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Op
 
             # 馬選択と投票
             if await select_horse_and_bet_simple(page, ticket.horse_number, ticket.horse_name, ticket.amount):
-                logger.info(f"✅ Ticket {ticket_idx+1} completed successfully")
-                # 購入成功をS3に即時記録（クラッシュ前に永続化）
-                if history_service:
-                    history_service.record_purchase(ticket, target_date)
+                logger.info(f"✅ Ticket {ticket_idx+1} screen confirmation OK")
+
+                # 照会メニューで実際の購入を確認
+                logger.info("🔍 Verifying purchase in inquiry menu...")
+                verified, matched_bet = await verify_purchase_in_inquiry(page, ticket, target_date)
+
+                if verified:
+                    logger.info(f"✅ Ticket {ticket_idx+1} VERIFIED in inquiry")
+                    # 照会確認済みをS3に記録
+                    if history_service:
+                        history_service.record_purchase(ticket, target_date)
+                else:
+                    logger.error(f"⚠️ Ticket {ticket_idx+1} UNVERIFIED - screen showed success but inquiry failed")
+                    # 未確認をS3に記録
+                    if history_service:
+                        history_service.record_unverified_purchase(ticket, target_date)
+                    # 注意: ここではSlack通知は送らない（Lambda handler側で送信する）
             else:
-                logger.error(f"❌ Ticket {ticket_idx+1} failed")
+                logger.error(f"❌ Ticket {ticket_idx+1} failed at screen level")
                 if history_service:
                     history_service.record_purchase_error(ticket, target_date, "select_horse_and_bet_simple returned False")
 
             # 次のチケットのため少し待機
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(3000)
 
         except Exception as e:
             logger.error(f"Error processing ticket {ticket_idx+1}: {e}")

@@ -359,8 +359,29 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date:
             # 購入実行（成功時にS3に記録）
             await process_tickets(page, to_purchase, target_date)
 
+            # S3履歴から結果を取得してUNVERIFIED件数をカウント
+            try:
+                from services.purchase_history import PurchaseHistoryService
+                history_service = PurchaseHistoryService()
+                history = history_service.load_history(target_date, use_cache=False)
+                tickets_list = history.get('tickets', [])
+
+                purchased_count = sum(1 for t in tickets_list if t.get('status') == 'PURCHASED')
+                unverified_count = sum(1 for t in tickets_list if t.get('status') == 'UNVERIFIED')
+                failed_count = sum(1 for t in tickets_list if t.get('status') == 'FAILED')
+
+                # UNVERIFIEDチケットの詳細を保存
+                unverified_tickets = [t for t in tickets_list if t.get('status') == 'UNVERIFIED']
+
+                results['tickets_purchased'] = purchased_count
+                results['tickets_unverified'] = unverified_count
+                results['tickets_failed'] = failed_count
+                results['unverified_tickets'] = unverified_tickets
+            except Exception as e:
+                logger.warning(f"Failed to load history for result counting: {e}")
+                results['tickets_purchased'] = len(to_purchase)
+
             results['status'] = 'success'
-            results['tickets_purchased'] = len(to_purchase)
 
             await browser.close()
 
@@ -492,11 +513,24 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'body': results
             }
 
+        # 購入検証失敗（UNVERIFIED）チケットのSlack通知
+        unverified_tickets = results.get('unverified_tickets', [])
+        for ticket in unverified_tickets:
+            slack.send_purchase_verification_failed(
+                target_date,
+                ticket.get('race_course', ''),
+                ticket.get('race_number', 0),
+                ticket.get('horse_number', 0),
+                ticket.get('horse_name', ''),  # 履歴にはhorse_nameがない場合もある
+                ticket.get('amount', 0)
+            )
+
         # 完了通知
         purchased = results.get('tickets_purchased', 0) or results.get('tickets_to_purchase', 0)
         skipped = results.get('tickets_skipped', 0)
+        unverified = results.get('tickets_unverified', 0)
         total_cost = results.get('total_cost', purchased * bet_amount)
-        slack.send_purchase_complete(target_date, purchased, skipped, total_cost, dry_run)
+        slack.send_purchase_complete(target_date, purchased, skipped + unverified, total_cost, dry_run)
 
         return {
             'statusCode': 200,
