@@ -61,6 +61,17 @@ os.makedirs('/tmp/output/screenshots', exist_ok=True)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 sys.path.insert(0, '/var/task/scripts')
 
+# DepositFailedExceptionのインポート（入金失敗時の専用通知用）
+try:
+    from bot_simple import DepositFailedException
+except ImportError:
+    # フォールバック（インポート失敗時は汎用Exceptionとして扱う）
+    class DepositFailedException(Exception):
+        def __init__(self, requested_amount=0, actual_balance=0, message=None):
+            self.requested_amount = requested_amount
+            self.actual_balance = actual_balance
+            super().__init__(message or "Deposit failed")
+
 # ロギング設定
 logging.basicConfig(
     level=logging.INFO,
@@ -342,9 +353,8 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date:
                 await browser.close()
                 return results
 
-            # 残高確認と入金
-            if not await ensure_sufficient_balance(page, credentials, to_purchase):
-                raise Exception("Insufficient balance and deposit failed")
+            # 残高確認と入金（失敗時はDepositFailedExceptionが投げられる）
+            await ensure_sufficient_balance(page, credentials, to_purchase)
 
             # 購入実行（成功時にS3に記録）
             await process_tickets(page, to_purchase, target_date)
@@ -353,6 +363,14 @@ async def run_purchase_bot(tickets_path: str, dry_run: bool = True, target_date:
             results['tickets_purchased'] = len(to_purchase)
 
             await browser.close()
+
+    except DepositFailedException as e:
+        # 入金失敗の専用処理（Slack通知は呼び出し元で行う）
+        logger.error(f"Deposit failed: {e}")
+        results['status'] = 'deposit_failed'
+        results['error'] = str(e)
+        results['deposit_requested_amount'] = e.requested_amount
+        results['deposit_actual_balance'] = e.actual_balance
 
     except Exception as e:
         import traceback
@@ -463,6 +481,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         result_key = s3_client.upload_results(output_bucket, target_date, results)
         results['result_s3_key'] = result_key
+
+        # 入金失敗の場合は専用通知
+        if results.get('status') == 'deposit_failed':
+            requested_amount = results.get('deposit_requested_amount', 0)
+            actual_balance = results.get('deposit_actual_balance', 0)
+            slack.send_deposit_failed(target_date, requested_amount, actual_balance)
+            return {
+                'statusCode': 500,
+                'body': results
+            }
 
         # 完了通知
         purchased = results.get('tickets_purchased', 0) or results.get('tickets_to_purchase', 0)
