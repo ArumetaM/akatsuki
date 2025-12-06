@@ -2281,7 +2281,7 @@ async def ensure_sufficient_balance(page: Page, credentials: dict, to_purchase: 
         return True
 
 
-async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Optional[str] = None):
+async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Optional[str] = None, slack_service=None):
     """
     未購入チケットを処理
 
@@ -2289,6 +2289,7 @@ async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Op
         page: Playwright page
         to_purchase: 購入すべきチケットのリスト
         target_date: 対象日（YYYYMMDD形式、Noneの場合は当日）
+        slack_service: SlackService インスタンス（個別購入通知用）
     """
     # target_dateがない場合は当日を使用
     if target_date is None:
@@ -2341,6 +2342,16 @@ async def process_tickets(page: Page, to_purchase: List[Ticket], target_date: Op
                     # 照会確認済みをS3に記録
                     if history_service:
                         history_service.record_purchase(ticket, target_date)
+                    # bets-liveチャンネルに購入成功通知を送信
+                    if slack_service:
+                        slack_service.send_bet_notification(
+                            ticket.racecourse,
+                            ticket.race_number,
+                            ticket.horse_number,
+                            ticket.horse_name,
+                            ticket.amount,
+                            success=True
+                        )
                 else:
                     logger.error(f"⚠️ Ticket {ticket_idx+1} UNVERIFIED - screen showed success but inquiry failed")
                     # 未確認をS3に記録

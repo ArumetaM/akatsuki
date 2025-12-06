@@ -47,14 +47,14 @@ class SlackService:
             # 環境変数からチャンネルID取得
             self.ops_channel = os.environ.get("SLACK_channel_id_ops")
             self.alerts_channel = os.environ.get("SLACK_channel_id_alerts")
-            self.bets_channel = os.environ.get("SLACK_channel_id_bets")
+            self.bets_channel = os.environ.get("SLACK_channel_id_bets-live")
 
             if not self.bot_token:
                 logger.warning("Slackボットトークンが設定されていません")
             if not self.ops_channel:
                 logger.warning("Slackチャンネル ID (SLACK_channel_id_ops) が設定されていません")
             if not self.bets_channel:
-                logger.warning("Slack購入チャンネル ID (SLACK_channel_id_bets) が設定されていません")
+                logger.warning("Slack購入チャンネル ID (SLACK_channel_id_bets-live) が設定されていません")
 
         except Exception as e:
             logger.error(f"Slack設定の初期化に失敗しました: {str(e)}")
