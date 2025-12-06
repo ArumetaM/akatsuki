@@ -132,6 +132,15 @@ class SlackService:
             f":x: 購入処理エラー: {formatted_date}\n   {error_msg}"
         )
 
+    def send_deposit_failed(self, target_date: str, requested_amount: int, actual_balance: int) -> bool:
+        """入金失敗通知（銀行口座残高不足の可能性）"""
+        formatted_date = self._format_date(target_date)
+        msg = f":rotating_light: 入金失敗（銀行口座残高不足の可能性）: {formatted_date}\n"
+        msg += f"   入金リクエスト額: ¥{requested_amount:,}\n"
+        msg += f"   現在のIPAT残高: ¥{actual_balance:,}\n"
+        msg += f"   :warning: 銀行口座への入金を確認してください"
+        return self._send_message(self.alerts_channel or self.ops_channel, msg)
+
     def _format_date(self, date: str) -> str:
         """日付フォーマット（YYYYMMDD → YYYY/MM/DD）"""
         if len(date) == 8:

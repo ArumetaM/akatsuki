@@ -60,6 +60,15 @@ class TicketStatus(Enum):
     PURCHASE_FAILED = "purchase_failed"          # 購入失敗
 
 
+class DepositFailedException(Exception):
+    """入金失敗例外（銀行口座残高不足の可能性）"""
+    def __init__(self, requested_amount: int, actual_balance: int, message: str = None):
+        self.requested_amount = requested_amount
+        self.actual_balance = actual_balance
+        self.message = message or f"入金失敗: リクエスト額 {requested_amount:,}円, 現在残高 {actual_balance:,}円"
+        super().__init__(self.message)
+
+
 @dataclass
 class ExistingBet:
     """既存の投票データ（投票内容照会から取得）"""
@@ -574,13 +583,13 @@ async def get_current_balance(page: Page) -> int:
         logger.warning("⚠️ Could not find balance on page, taking screenshot for debugging")
         await take_screenshot(page, "balance_not_found")
 
-        # 見つからない場合でも0を返す（エラーにはしない）
-        logger.info("💰 Current balance: unknown (assuming sufficient)")
-        return 999999  # 不明な場合は十分な金額と仮定
+        # 見つからない場合は0を返す（安全側に倒す）
+        logger.warning("⚠️ Could not find balance - assuming 0 for safety")
+        return 0  # 不明な場合は0と仮定（入金確認を促す）
 
     except Exception as e:
         logger.error(f"Failed to get balance: {e}")
-        return 999999  # エラー時も十分な金額と仮定
+        return 0  # エラー時も0と仮定（安全側に倒す）
 
 
 async def open_deposit_window(page: Page) -> Optional[Page]:
@@ -872,15 +881,26 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
             logger.error("❌ 入金が反映されませんでした。銀行口座の残高不足の可能性があります。")
             logger.error("❌ 投票処理を中止します。")
             await take_screenshot(page, "deposit_verification_timeout")
-            return False
+            # 入金失敗例外を投げる（Slack通知用の情報を含む）
+            raise DepositFailedException(
+                requested_amount=deposit_amount,
+                actual_balance=balance
+            )
 
         logger.info(f"✅ Deposit completed and verified: {balance:,}円")
         return True
 
+    except DepositFailedException:
+        # DepositFailedExceptionはそのまま再送出
+        raise
     except Exception as e:
         logger.error(f"❌ Failed to verify deposit balance: {e}")
         await take_screenshot(page, "deposit_verification_error")
-        return False
+        raise DepositFailedException(
+            requested_amount=deposit_amount,
+            actual_balance=0,
+            message=f"入金確認中にエラー発生: {e}"
+        )
 
 
 async def deposit(page: Page, credentials: dict, amount: int = 20000):
@@ -894,6 +914,9 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
 
     Returns:
         成功したらTrue
+
+    Raises:
+        DepositFailedException: 入金失敗時（銀行口座残高不足など）
     """
     try:
         deposit_amount = amount
@@ -902,28 +925,47 @@ async def deposit(page: Page, credentials: dict, amount: int = 20000):
         # 1. 入金ウィンドウを開く
         deposit_page = await open_deposit_window(page)
         if not deposit_page:
-            return False
+            raise DepositFailedException(
+                requested_amount=deposit_amount,
+                actual_balance=0,
+                message="入金ウィンドウを開けませんでした"
+            )
 
         # 2. 入金指示フォームへ遷移
         if not await navigate_to_deposit_form(deposit_page):
             await deposit_page.close()
-            return False
+            raise DepositFailedException(
+                requested_amount=deposit_amount,
+                actual_balance=0,
+                message="入金フォームへの遷移に失敗しました"
+            )
 
         # 3. 入金フォームを入力して送信
         if not await complete_and_submit_deposit(deposit_page, credentials, deposit_amount):
             await deposit_page.close()
-            return False
+            raise DepositFailedException(
+                requested_amount=deposit_amount,
+                actual_balance=0,
+                message="入金フォームの送信に失敗しました"
+            )
 
         # 4. 入金ウィンドウを閉じる
         await deposit_page.close()
 
-        # 5. 残高反映を確認
+        # 5. 残高反映を確認（失敗時はDepositFailedExceptionが投げられる）
         return await verify_deposit_balance(page, deposit_amount)
 
+    except DepositFailedException:
+        # DepositFailedExceptionはそのまま再送出
+        raise
     except Exception as e:
         logger.error(f"❌ Deposit failed: {e}")
         await take_screenshot(page, "deposit_error")
-        return False
+        raise DepositFailedException(
+            requested_amount=amount,
+            actual_balance=0,
+            message=f"入金処理中にエラー発生: {e}"
+        )
 
 
 async def perform_stage1_login(page: Page, credentials: dict):
@@ -2152,6 +2194,9 @@ async def ensure_sufficient_balance(page: Page, credentials: dict, to_purchase: 
 
     Returns:
         bool: 成功したらTrue
+
+    Raises:
+        DepositFailedException: 入金失敗時（銀行口座残高不足など）
     """
     # 未購入チケットの総費用を計算
     total_cost = sum(t.amount for t in to_purchase)
@@ -2167,12 +2212,10 @@ async def ensure_sufficient_balance(page: Page, credentials: dict, to_purchase: 
         logger.info(f"⚠️ Insufficient balance! Shortage: {shortage:,}円")
         logger.info(f"💸 Depositing shortage amount: {shortage:,}円")
 
-        if await deposit(page, credentials, shortage):
-            logger.info(f"✅ Deposit completed: {shortage:,}円")
-            return True
-        else:
-            logger.error("❌ Deposit failed - aborting ticket processing")
-            return False
+        # 入金処理（失敗時はDepositFailedExceptionが投げられる）
+        await deposit(page, credentials, shortage)
+        logger.info(f"✅ Deposit completed: {shortage:,}円")
+        return True
     else:
         logger.info(f"✅ Balance is sufficient ({current_balance:,}円 >= {total_cost:,}円), skipping deposit")
         return True
