@@ -1,0 +1,43 @@
+name: Docker Build Check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: purchase
+            dockerfile: lambda/Dockerfile
+          - name: evaluator
+            dockerfile: lambda/Dockerfile.evaluator
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image (${{ matrix.target.name }})
+        run: |
+          docker build \
+            -f ${{ matrix.target.dockerfile }} \
+            -t ${{ matrix.target.name }}:test \
+            .
+
+      - name: Image size check
+        run: |
+          SIZE=$(docker image inspect ${{ matrix.target.name }}:test --format='{{.Size}}')
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Image size: ${SIZE_MB}MB"
+          # Lambda container image limit is 10GB
+          if [ $SIZE_MB -gt 10240 ]; then
+            echo "::error::Image size exceeds 10GB limit"
+            exit 1
+          fi

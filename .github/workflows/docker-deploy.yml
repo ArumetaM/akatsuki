@@ -1,0 +1,83 @@
+name: Docker Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REGISTRY: 171227197604.dkr.ecr.ap-northeast-1.amazonaws.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: purchase
+            dockerfile: lambda/Dockerfile
+            ecr_repo: jrdb-main-purchase
+            lambda_function: jrdb-main-purchase
+          - name: evaluator
+            dockerfile: lambda/Dockerfile.evaluator
+            ecr_repo: jrdb-main-evaluator
+            lambda_function: jrdb-main-evaluator
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f ${{ matrix.target.dockerfile }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ matrix.target.ecr_repo }}:latest \
+            -t ${{ env.ECR_REGISTRY }}/${{ matrix.target.ecr_repo }}:${{ github.sha }} \
+            .
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.target.ecr_repo }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.target.ecr_repo }}:${{ github.sha }}
+
+      - name: Update Lambda function
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ matrix.target.lambda_function }} \
+            --image-uri ${{ env.ECR_REGISTRY }}/${{ matrix.target.ecr_repo }}:latest
+
+          # Wait for update to complete
+          aws lambda wait function-updated \
+            --function-name ${{ matrix.target.lambda_function }}
+
+          echo "Lambda ${{ matrix.target.lambda_function }} updated successfully"
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack on success
+        if: needs.deploy.result == 'success'
+        run: |
+          echo "Deployment successful - purchase and evaluator Lambda functions updated"
+
+      - name: Notify Slack on failure
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "::error::Deployment failed - check logs for details"
+          exit 1
