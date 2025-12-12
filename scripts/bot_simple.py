@@ -579,15 +579,11 @@ async def verify_purchase_in_inquiry(
         # 少し待機（購入が照会に反映されるまで）
         await page.wait_for_timeout(5000)
 
-        # PageNavigatorのインスタンス化
-        navigator = PageNavigator(page, logger)
+        # まずメインページに戻ってから照会を実行（購入後の状態をリセット）
+        await page.goto(IPAT_HOME_URL)
+        await page.wait_for_timeout(Timeouts.MEDIUM)
 
-        # 投票履歴ページへ遷移
-        if not await navigate_to_bet_history_page(page, navigator, "same_day"):
-            logger.warning("⚠️ Failed to navigate to bet history page for verification")
-            return False, None
-
-        # 既存投票を取得
+        # 既存投票を取得（fetch_existing_bets内で遷移とメインページ復帰を行う）
         existing_bets = await fetch_existing_bets(page, "same_day")
 
         # チケットと一致する投票を検索
@@ -608,13 +604,16 @@ async def verify_purchase_in_inquiry(
         return False, None
 
     finally:
-        # メインページに戻る（次のチケット処理のため）
+        # エラー時の安全策：メインページにいることを確認
+        # （fetch_existing_betsが正常終了すれば既にメインページにいるはず）
         try:
-            await page.goto(IPAT_HOME_URL)
-            await page.wait_for_timeout(Timeouts.MEDIUM)
-            logger.info("🔄 Returned to main page after verification")
+            current_url = page.url
+            if "pw_890_i.cgi" not in current_url:
+                await page.goto(IPAT_HOME_URL)
+                await page.wait_for_timeout(Timeouts.MEDIUM)
+                logger.info("🔄 Returned to main page after verification")
         except Exception as e:
-            logger.warning(f"⚠️ Failed to return to main page: {e}")
+            logger.warning(f"⚠️ Failed to check/return to main page: {e}")
 
 
 async def get_current_balance(page: Page) -> int:

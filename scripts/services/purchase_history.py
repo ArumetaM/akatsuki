@@ -144,7 +144,9 @@ class PurchaseHistoryService:
         tickets = history.get("tickets", [])
 
         for record in tickets:
-            # 購入成功のレコードのみチェック
+            # 購入成功（PURCHASED）のレコードのみチェック
+            # UNVERIFIED（画面成功・照会失敗）はIPATの履歴チェックに任せる
+            # FAILEDは明確に失敗なのでスキップ
             if record.get("status") != "PURCHASED":
                 continue
 
