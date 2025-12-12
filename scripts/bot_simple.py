@@ -1980,12 +1980,8 @@ async def select_horse_and_bet_simple(page: Page, horse_number: int, horse_name:
     try:
         logger.info(f"🎯 Selecting horse #{horse_number} {horse_name}, bet {bet_amount} yen...")
 
-        # 購入前に残高をチェック（念のため）
-        balance = await get_current_balance(page)
-        if balance < bet_amount:
-            logger.error(f"❌ Insufficient balance! Required: {bet_amount:,}円, Available: {balance:,}円")
-            await take_screenshot(page, f"insufficient_balance_{horse_number}")
-            return False
+        # 注: 残高チェックはメインページのensure_sufficient_balanceで行っているため、
+        # 投票ページでの再チェックは不要（投票ページでは「購入限度額」が表示されないため誤判定の原因になる）
 
         await page.wait_for_timeout(Timeouts.LONG)
 
