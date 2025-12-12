@@ -73,10 +73,16 @@ except ImportError:
             super().__init__(message or "Deposit failed")
 
 # ロギング設定
+# Lambda環境ではルートロガーを設定し、全モジュールのログを確実に出力
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True  # 既存のハンドラーを上書き
 )
+# ルートロガーのレベルを明示的に設定
+logging.getLogger().setLevel(logging.INFO)
+# bot_simpleモジュールのログも確実に出力
+logging.getLogger('bot_simple').setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 

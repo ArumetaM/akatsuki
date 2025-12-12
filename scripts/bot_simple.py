@@ -919,7 +919,17 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
             # ページをリロードして最新の残高を取得
             logger.info("🔄 Reloading page to get latest balance...")
             await page.reload()
-            await page.wait_for_timeout(3000)  # リロード後の安定待ち
+            await page.wait_for_timeout(5000)  # リロード後の安定待ち（Angular読み込み考慮）
+
+            # 「更新」ボタンがあればクリックして残高を最新化
+            try:
+                update_btn = await page.query_selector('button:has-text("更新")')
+                if update_btn:
+                    logger.info("🔄 Clicking '更新' button to refresh balance...")
+                    await update_btn.click()
+                    await page.wait_for_timeout(3000)  # 更新後の安定待ち
+            except Exception as e:
+                logger.warning(f"⚠️ Could not click update button: {e}")
 
             # 残高を確認
             balance = await get_current_balance(page)
