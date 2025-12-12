@@ -73,10 +73,16 @@ except ImportError:
             super().__init__(message or "Deposit failed")
 
 # ロギング設定
+# Lambda環境ではルートロガーを設定し、全モジュールのログを確実に出力
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True  # 既存のハンドラーを上書き
 )
+# ルートロガーのレベルを明示的に設定
+logging.getLogger().setLevel(logging.INFO)
+# bot_simpleモジュールのログも確実に出力
+logging.getLogger('bot_simple').setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -409,17 +415,46 @@ def get_target_date(event: Dict[str, Any]) -> str:
     """
     イベントからtarget_dateを取得
 
+    推論結果に含まれるtarget_dateを優先的に使用する。
+    推論は翌日のレースを対象にするため、Purchaseも同じ日付を使用する必要がある。
+
     Args:
         event: Lambdaイベント
 
     Returns:
         YYYYMMDD形式の日付文字列
     """
+    # Step Functionsからの推論結果を確認
+    inference_result = event.get('inference_result', {})
+    if isinstance(inference_result, dict) and 'Payload' in inference_result:
+        payload = inference_result['Payload']
+        # Payloadがstring（JSON）の場合はパース
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                pass
+        # bodyがstring（JSON）の場合もパース
+        if isinstance(payload, dict):
+            body = payload.get('body', {})
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except json.JSONDecodeError:
+                    body = {}
+            # 推論結果のtarget_dateを使用
+            if isinstance(body, dict) and 'target_date' in body:
+                inferred_date = body['target_date']
+                logger.info(f"Using target_date from inference result: {inferred_date}")
+                return inferred_date
+
+    # 明示的に指定されたtarget_dateを確認
     target_date = event.get('target_date', 'auto')
 
     if target_date == 'auto':
-        # 当日の日付を使用
-        return datetime.now().strftime('%Y%m%d')
+        # 翌日の日付を使用（推論は翌日のレースを対象とするため）
+        tomorrow = datetime.now() + timedelta(days=1)
+        return tomorrow.strftime('%Y%m%d')
 
     return target_date
 
