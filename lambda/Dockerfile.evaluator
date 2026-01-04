@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.evaluator.txt
 # アプリケーションコードをコピー
 COPY lambda/evaluator_handler.py ./
 COPY lambda/slack_service.py ./
+COPY scripts/services/ ./services/
 
 # Lambda実行ユーザーが読み取れるようパーミッションを修正
 RUN chmod 644 *.py
