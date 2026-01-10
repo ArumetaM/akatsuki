@@ -62,6 +62,8 @@ class BetDetail:
     payout: int = 0
     odds: float = 0.0
     finish_position: int = 0
+    pred_prob: float = 0.0  # 予測確率
+    standard_odds: float = 0.0  # 推論時点のオッズ
 
 
 @dataclass
@@ -88,6 +90,54 @@ class CumulativeSummary:
     profit: int = 0
     current_streak: int = 0  # 正:連勝、負:連敗
     max_drawdown: int = 0
+
+
+@dataclass
+class YearlySummary:
+    """年度別サマリー"""
+    year: int
+    total_bets: int = 0
+    hits: int = 0
+    hit_rate: float = 0.0
+    total_investment: int = 0
+    total_payout: int = 0
+    roi: float = 0.0
+    profit: int = 0
+
+
+@dataclass
+class MonthlySummary:
+    """月次サマリー"""
+    year_month: str  # "202601"
+    total_bets: int = 0
+    hits: int = 0
+    hit_rate: float = 0.0
+    total_investment: int = 0
+    total_payout: int = 0
+    roi: float = 0.0
+    profit: int = 0
+
+
+@dataclass
+class OddsBandSummary:
+    """オッズ帯別サマリー"""
+    band_name: str  # "〜2倍", "2-5倍", "5-10倍", "10倍〜"
+    total_bets: int = 0
+    hits: int = 0
+    hit_rate: float = 0.0
+    total_investment: int = 0
+    total_payout: int = 0
+    roi: float = 0.0
+
+
+@dataclass
+class PredProbBandSummary:
+    """予測確率帯別サマリー"""
+    band_name: str  # "15-20%", "20-25%", "25-30%", "30%+"
+    expected_rate: float  # 期待的中率（帯の中央値）
+    total_bets: int = 0
+    hits: int = 0
+    actual_hit_rate: float = 0.0
 
 
 class EvaluatorService:
@@ -175,6 +225,10 @@ class EvaluatorService:
                 logger.debug(f"未購入のためスキップ: {place_name} {race_number}R {horse_number}番")
                 continue
 
+            # 推論結果から予測確率とオッズを取得
+            pred_prob = float(row.get('pred_prob', 0.0))
+            standard_odds = float(row.get('StandardOdds', 0.0))
+
             # 場コード変換
             place_code = PLACE_CODE_MAP.get(place_name, '')
             if not place_code:
@@ -219,7 +273,9 @@ class EvaluatorService:
                 is_hit=is_hit,
                 payout=payout,
                 odds=odds,
-                finish_position=finish_position
+                finish_position=finish_position,
+                pred_prob=pred_prob,
+                standard_odds=standard_odds
             )
             evaluated.append(detail)
 
@@ -323,8 +379,270 @@ class EvaluatorService:
 
         return cumulative
 
+    def get_all_evaluation_details(self, include_date: Optional[str] = None) -> List[dict]:
+        """過去すべての評価結果からdetailsを取得
+
+        Args:
+            include_date: この日付も含める（当日データを含めたい場合）
+        """
+        all_details = []
+
+        try:
+            paginator = self.s3.get_paginator('list_objects_v2')
+            prefix = "evaluation-results/"
+
+            for page in paginator.paginate(Bucket=self.financial_bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    key = obj['Key']
+                    if 'daily_' in key and key.endswith('.json'):
+                        date_part = key.split('daily_')[1].split('.')[0]
+
+                        response = self.s3.get_object(Bucket=self.financial_bucket, Key=key)
+                        data = json.loads(response['Body'].read().decode('utf-8'))
+
+                        if 'details' in data:
+                            for detail in data['details']:
+                                detail['date'] = date_part
+                                all_details.append(detail)
+
+        except Exception as e:
+            logger.warning(f"評価履歴取得エラー: {e}")
+
+        return all_details
+
+    def calculate_yearly_summaries(self, all_details: List[dict],
+                                   current_details: List[BetDetail] = None,
+                                   current_date: str = None) -> List[YearlySummary]:
+        """年度別サマリー計算"""
+        yearly_data = {}
+
+        # 過去データを年度別に集計
+        for detail in all_details:
+            date = detail.get('date', '')
+            if len(date) >= 4:
+                year = int(date[:4])
+                if year not in yearly_data:
+                    yearly_data[year] = {
+                        'total_bets': 0, 'hits': 0,
+                        'total_investment': 0, 'total_payout': 0
+                    }
+                yearly_data[year]['total_bets'] += 1
+                if detail.get('is_hit'):
+                    yearly_data[year]['hits'] += 1
+                yearly_data[year]['total_investment'] += detail.get('amount', 0)
+                yearly_data[year]['total_payout'] += detail.get('payout', 0)
+
+        # 当日データを追加
+        if current_details and current_date:
+            year = int(current_date[:4])
+            if year not in yearly_data:
+                yearly_data[year] = {
+                    'total_bets': 0, 'hits': 0,
+                    'total_investment': 0, 'total_payout': 0
+                }
+            for d in current_details:
+                yearly_data[year]['total_bets'] += 1
+                if d.is_hit:
+                    yearly_data[year]['hits'] += 1
+                yearly_data[year]['total_investment'] += d.amount
+                yearly_data[year]['total_payout'] += d.payout
+
+        # YearlySummary生成
+        summaries = []
+        for year, data in sorted(yearly_data.items(), reverse=True):
+            hit_rate = round(data['hits'] / data['total_bets'], 4) if data['total_bets'] > 0 else 0.0
+            profit = data['total_payout'] - data['total_investment']
+            roi = round(profit / data['total_investment'] * 100, 2) if data['total_investment'] > 0 else 0.0
+
+            summaries.append(YearlySummary(
+                year=year,
+                total_bets=data['total_bets'],
+                hits=data['hits'],
+                hit_rate=hit_rate,
+                total_investment=data['total_investment'],
+                total_payout=data['total_payout'],
+                roi=roi,
+                profit=profit
+            ))
+
+        return summaries
+
+    def calculate_monthly_summary(self, all_details: List[dict],
+                                  current_details: List[BetDetail] = None,
+                                  year_month: str = None) -> MonthlySummary:
+        """月次サマリー計算"""
+        if not year_month:
+            year_month = datetime.now().strftime('%Y%m')
+
+        data = {
+            'total_bets': 0, 'hits': 0,
+            'total_investment': 0, 'total_payout': 0
+        }
+
+        # 過去データから当月分を集計
+        for detail in all_details:
+            date = detail.get('date', '')
+            if len(date) >= 6 and date[:6] == year_month:
+                data['total_bets'] += 1
+                if detail.get('is_hit'):
+                    data['hits'] += 1
+                data['total_investment'] += detail.get('amount', 0)
+                data['total_payout'] += detail.get('payout', 0)
+
+        # 当日データを追加（当月の場合）
+        if current_details and year_month:
+            for d in current_details:
+                data['total_bets'] += 1
+                if d.is_hit:
+                    data['hits'] += 1
+                data['total_investment'] += d.amount
+                data['total_payout'] += d.payout
+
+        hit_rate = round(data['hits'] / data['total_bets'], 4) if data['total_bets'] > 0 else 0.0
+        profit = data['total_payout'] - data['total_investment']
+        roi = round(profit / data['total_investment'] * 100, 2) if data['total_investment'] > 0 else 0.0
+
+        return MonthlySummary(
+            year_month=year_month,
+            total_bets=data['total_bets'],
+            hits=data['hits'],
+            hit_rate=hit_rate,
+            total_investment=data['total_investment'],
+            total_payout=data['total_payout'],
+            roi=roi,
+            profit=profit
+        )
+
+    def calculate_odds_band_summaries(self, all_details: List[dict],
+                                      current_details: List[BetDetail] = None) -> List[OddsBandSummary]:
+        """オッズ帯別サマリー計算（累計）
+
+        オッズ帯（4段階）:
+        - 〜2倍
+        - 2-5倍
+        - 5-10倍
+        - 10倍〜
+        """
+        bands = {
+            '〜2倍': {'min': 0, 'max': 2.0, 'total_bets': 0, 'hits': 0, 'investment': 0, 'payout': 0},
+            '2-5倍': {'min': 2.0, 'max': 5.0, 'total_bets': 0, 'hits': 0, 'investment': 0, 'payout': 0},
+            '5-10倍': {'min': 5.0, 'max': 10.0, 'total_bets': 0, 'hits': 0, 'investment': 0, 'payout': 0},
+            '10倍〜': {'min': 10.0, 'max': float('inf'), 'total_bets': 0, 'hits': 0, 'investment': 0, 'payout': 0},
+        }
+
+        def get_band(odds: float) -> str:
+            for band_name, config in bands.items():
+                if config['min'] <= odds < config['max']:
+                    return band_name
+            return '10倍〜'
+
+        # 過去データ集計（standard_oddsを使用）
+        for detail in all_details:
+            odds = detail.get('standard_odds', 0.0) or detail.get('odds', 0.0)
+            if odds <= 0:
+                continue
+            band = get_band(odds)
+            bands[band]['total_bets'] += 1
+            if detail.get('is_hit'):
+                bands[band]['hits'] += 1
+            bands[band]['investment'] += detail.get('amount', 0)
+            bands[band]['payout'] += detail.get('payout', 0)
+
+        # 当日データ追加
+        if current_details:
+            for d in current_details:
+                odds = d.standard_odds if d.standard_odds > 0 else d.odds
+                if odds <= 0:
+                    continue
+                band = get_band(odds)
+                bands[band]['total_bets'] += 1
+                if d.is_hit:
+                    bands[band]['hits'] += 1
+                bands[band]['investment'] += d.amount
+                bands[band]['payout'] += d.payout
+
+        summaries = []
+        for band_name in ['〜2倍', '2-5倍', '5-10倍', '10倍〜']:
+            data = bands[band_name]
+            hit_rate = round(data['hits'] / data['total_bets'], 4) if data['total_bets'] > 0 else 0.0
+            profit = data['payout'] - data['investment']
+            roi = round(profit / data['investment'] * 100, 2) if data['investment'] > 0 else 0.0
+
+            summaries.append(OddsBandSummary(
+                band_name=band_name,
+                total_bets=data['total_bets'],
+                hits=data['hits'],
+                hit_rate=hit_rate,
+                total_investment=data['investment'],
+                total_payout=data['payout'],
+                roi=roi
+            ))
+
+        return summaries
+
+    def calculate_pred_prob_band_summaries(self, all_details: List[dict],
+                                           current_details: List[BetDetail] = None) -> List[PredProbBandSummary]:
+        """予測確率帯別サマリー計算（累計）
+
+        確率帯:
+        - 15-20%
+        - 20-25%
+        - 25-30%
+        - 30%+
+        """
+        bands = {
+            '15-20%': {'min': 0.15, 'max': 0.20, 'expected': 0.175, 'total_bets': 0, 'hits': 0},
+            '20-25%': {'min': 0.20, 'max': 0.25, 'expected': 0.225, 'total_bets': 0, 'hits': 0},
+            '25-30%': {'min': 0.25, 'max': 0.30, 'expected': 0.275, 'total_bets': 0, 'hits': 0},
+            '30%+': {'min': 0.30, 'max': 1.0, 'expected': 0.35, 'total_bets': 0, 'hits': 0},
+        }
+
+        def get_band(prob: float) -> Optional[str]:
+            if prob < 0.15:
+                return None  # 15%未満は対象外
+            for band_name, config in bands.items():
+                if config['min'] <= prob < config['max']:
+                    return band_name
+            return '30%+'
+
+        # 過去データ集計
+        for detail in all_details:
+            prob = detail.get('pred_prob', 0.0)
+            band = get_band(prob)
+            if band is None:
+                continue
+            bands[band]['total_bets'] += 1
+            if detail.get('is_hit'):
+                bands[band]['hits'] += 1
+
+        # 当日データ追加
+        if current_details:
+            for d in current_details:
+                band = get_band(d.pred_prob)
+                if band is None:
+                    continue
+                bands[band]['total_bets'] += 1
+                if d.is_hit:
+                    bands[band]['hits'] += 1
+
+        summaries = []
+        for band_name in ['15-20%', '20-25%', '25-30%', '30%+']:
+            data = bands[band_name]
+            actual_rate = round(data['hits'] / data['total_bets'], 4) if data['total_bets'] > 0 else 0.0
+
+            summaries.append(PredProbBandSummary(
+                band_name=band_name,
+                expected_rate=data['expected'],
+                total_bets=data['total_bets'],
+                hits=data['hits'],
+                actual_hit_rate=actual_rate
+            ))
+
+        return summaries
+
     def save_evaluation_result(self, target_date: str, summary: DailySummary,
-                               details: List[BetDetail], cumulative: CumulativeSummary) -> str:
+                               details: List[BetDetail], cumulative: CumulativeSummary,
+                               extended: Optional[dict] = None) -> str:
         """評価結果をS3に保存"""
         year = target_date[:4]
         month = target_date[4:6]
@@ -338,6 +656,10 @@ class EvaluatorService:
             'cumulative': asdict(cumulative),
             'timestamp': datetime.now().isoformat()
         }
+
+        # 拡張サマリーを追加
+        if extended:
+            result['extended'] = extended
 
         self.s3.put_object(
             Bucket=self.financial_bucket,
@@ -354,8 +676,12 @@ class EvaluatorSlackService(SlackService):
     """評価用Slack通知サービス（継承）"""
 
     def send_daily_evaluation(self, target_date: str, summary: DailySummary,
-                              cumulative: CumulativeSummary) -> bool:
-        """日次評価通知"""
+                              cumulative: CumulativeSummary,
+                              yearly: List[YearlySummary] = None,
+                              monthly: MonthlySummary = None,
+                              odds_bands: List[OddsBandSummary] = None,
+                              pred_prob_bands: List[PredProbBandSummary] = None) -> bool:
+        """日次評価通知（拡張版）"""
         formatted_date = self._format_date(target_date)
 
         msg = f":bar_chart: {formatted_date} 購入結果評価\n\n"
@@ -375,9 +701,45 @@ class EvaluatorSlackService(SlackService):
             msg += f"   払戻: ¥{cumulative.total_payout:,}\n"
             msg += f"   損益: ¥{cumulative.profit:+,} (ROI: {cumulative.roi:+.1f}%)\n"
             if cumulative.current_streak < 0:
-                msg += f"   連敗: {abs(cumulative.current_streak)}"
+                msg += f"   連敗: {abs(cumulative.current_streak)}\n"
             else:
-                msg += f"   連勝: {cumulative.current_streak}"
+                msg += f"   連勝: {cumulative.current_streak}\n"
+
+        # 年度別（当年のみ表示）
+        if yearly:
+            current_year = int(target_date[:4])
+            for ys in yearly:
+                if ys.year == current_year and ys.total_bets > 0:
+                    msg += f"\n*【{ys.year}年】*\n"
+                    msg += f"   的中: {ys.hits}/{ys.total_bets} ({ys.hit_rate*100:.1f}%)\n"
+                    msg += f"   損益: ¥{ys.profit:+,} (ROI: {ys.roi:+.1f}%)\n"
+                    break
+
+        # 月次
+        if monthly and monthly.total_bets > 0:
+            year_month = monthly.year_month
+            month_num = int(year_month[4:6])
+            msg += f"\n*【{month_num}月】*\n"
+            msg += f"   的中: {monthly.hits}/{monthly.total_bets} ({monthly.hit_rate*100:.1f}%)\n"
+            msg += f"   損益: ¥{monthly.profit:+,} (ROI: {monthly.roi:+.1f}%)\n"
+
+        # オッズ帯別（データがある帯のみ）
+        if odds_bands:
+            has_data = any(ob.total_bets > 0 for ob in odds_bands)
+            if has_data:
+                msg += f"\n*【オッズ帯別】* 累計\n"
+                for ob in odds_bands:
+                    if ob.total_bets > 0:
+                        msg += f"   {ob.band_name}: {ob.hits}/{ob.total_bets} ({ob.hit_rate*100:.1f}%) ROI: {ob.roi:+.1f}%\n"
+
+        # 予測確率帯別（データがある帯のみ）
+        if pred_prob_bands:
+            has_data = any(pb.total_bets > 0 for pb in pred_prob_bands)
+            if has_data:
+                msg += f"\n*【確率帯別】* 累計\n"
+                for pb in pred_prob_bands:
+                    if pb.total_bets > 0:
+                        msg += f"   {pb.band_name}: {pb.hits}/{pb.total_bets} ({pb.actual_hit_rate*100:.1f}%) 期待:{pb.expected_rate*100:.1f}%\n"
 
         return self._send_message(self.ops_channel, msg)
 
@@ -490,11 +852,43 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             last_hit = details[-1].is_hit
             cumulative.current_streak = 1 if last_hit else -1
 
+        # 拡張サマリー計算
+        all_details = service.get_all_evaluation_details()
+        yearly_summaries = service.calculate_yearly_summaries(
+            all_details, current_details=details, current_date=target_date
+        )
+        year_month = target_date[:6]
+        monthly_summary = service.calculate_monthly_summary(
+            all_details, current_details=details, year_month=year_month
+        )
+        odds_band_summaries = service.calculate_odds_band_summaries(
+            all_details, current_details=details
+        )
+        pred_prob_band_summaries = service.calculate_pred_prob_band_summaries(
+            all_details, current_details=details
+        )
+
+        # 拡張データを辞書形式で作成
+        extended = {
+            'yearly': [asdict(ys) for ys in yearly_summaries],
+            'monthly': asdict(monthly_summary),
+            'odds_bands': [asdict(ob) for ob in odds_band_summaries],
+            'pred_prob_bands': [asdict(pb) for pb in pred_prob_band_summaries]
+        }
+
         # S3に保存
-        result_key = service.save_evaluation_result(target_date, summary, details, cumulative)
+        result_key = service.save_evaluation_result(
+            target_date, summary, details, cumulative, extended=extended
+        )
 
         # Slack通知
-        slack.send_daily_evaluation(target_date, summary, cumulative)
+        slack.send_daily_evaluation(
+            target_date, summary, cumulative,
+            yearly=yearly_summaries,
+            monthly=monthly_summary,
+            odds_bands=odds_band_summaries,
+            pred_prob_bands=pred_prob_band_summaries
+        )
 
         return {
             'statusCode': 200,
@@ -503,6 +897,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'target_date': target_date,
                 'summary': asdict(summary),
                 'cumulative': asdict(cumulative),
+                'extended': extended,
                 'result_key': result_key
             }
         }
