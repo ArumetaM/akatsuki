@@ -186,7 +186,7 @@ class EvaluatorService:
             raise
 
     def evaluate_bets(self, inference_df: pd.DataFrame, results_df: pd.DataFrame,
-                      target_date: str, bet_amount: int = 5000) -> List[BetDetail]:
+                      target_date: str, default_bet_amount: int = 5000) -> List[BetDetail]:
         """購入馬券の評価（実際に購入済みのもののみ）"""
         evaluated = []
 
@@ -196,7 +196,8 @@ class EvaluatorService:
         purchased_tickets = history.get('tickets', [])
 
         # 購入済みチケット（status=PURCHASED）のみをフィルタ
-        purchased_set = set()
+        # キー → チケット情報のマップ（金額を取得するため）
+        purchased_map = {}
         for ticket in purchased_tickets:
             if ticket.get('status') == 'PURCHASED':
                 key = (
@@ -205,13 +206,13 @@ class EvaluatorService:
                     ticket.get('horse_number'),
                     ticket.get('bet_type', '単勝')
                 )
-                purchased_set.add(key)
+                purchased_map[key] = ticket
 
-        if not purchased_set:
+        if not purchased_map:
             logger.info(f"購入済みチケットなし（{target_date}）- 評価スキップ")
             return evaluated
 
-        logger.info(f"購入済みチケット: {len(purchased_set)}件")
+        logger.info(f"購入済みチケット: {len(purchased_map)}件")
 
         for _, row in inference_df.iterrows():
             place_name = row['PlaceName']
@@ -221,9 +222,13 @@ class EvaluatorService:
 
             # 購入履歴に存在するかチェック
             ticket_key = (place_name, race_number, horse_number, '単勝')
-            if ticket_key not in purchased_set:
+            if ticket_key not in purchased_map:
                 logger.debug(f"未購入のためスキップ: {place_name} {race_number}R {horse_number}番")
                 continue
+
+            # 購入履歴から金額を取得（なければデフォルト値）
+            ticket = purchased_map[ticket_key]
+            bet_amount = ticket.get('amount', default_bet_amount)
 
             # 推論結果から予測確率とオッズを取得
             pred_prob = float(row.get('pred_prob', 0.0))
