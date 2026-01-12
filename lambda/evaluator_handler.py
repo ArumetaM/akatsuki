@@ -384,11 +384,11 @@ class EvaluatorService:
 
         return cumulative
 
-    def get_all_evaluation_details(self, include_date: Optional[str] = None) -> List[dict]:
+    def get_all_evaluation_details(self, exclude_date: Optional[str] = None) -> List[dict]:
         """過去すべての評価結果からdetailsを取得
 
         Args:
-            include_date: この日付も含める（当日データを含めたい場合）
+            exclude_date: この日付を除外する（当日データを除外したい場合）
         """
         all_details = []
 
@@ -401,6 +401,10 @@ class EvaluatorService:
                     key = obj['Key']
                     if 'daily_' in key and key.endswith('.json'):
                         date_part = key.split('daily_')[1].split('.')[0]
+
+                        # 指定日付を除外（再実行時のダブルカウント防止）
+                        if exclude_date and date_part >= exclude_date:
+                            continue
 
                         response = self.s3.get_object(Bucket=self.financial_bucket, Key=key)
                         data = json.loads(response['Body'].read().decode('utf-8'))
@@ -858,7 +862,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             cumulative.current_streak = 1 if last_hit else -1
 
         # 拡張サマリー計算
-        all_details = service.get_all_evaluation_details()
+        all_details = service.get_all_evaluation_details(exclude_date=target_date)
         yearly_summaries = service.calculate_yearly_summaries(
             all_details, current_details=details, current_date=target_date
         )
