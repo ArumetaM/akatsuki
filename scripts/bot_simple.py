@@ -915,6 +915,11 @@ async def verify_deposit_balance(page: Page, deposit_amount: int) -> bool:
                 logger.info("⏳ Waiting 60 seconds for deposit to reflect...")
                 await page.wait_for_timeout(60000)  # 60秒待機
 
+            # メインページに遷移してから残高を確認（入金ウィンドウ閉じた後は別ページにいる可能性があるため）
+            logger.info("🔄 Navigating to main page to check balance...")
+            await page.goto(IPAT_HOME_URL)
+            await page.wait_for_timeout(5000)  # ページ遷移後の安定待ち
+
             # ページをリロードして最新の残高を取得
             logger.info("🔄 Reloading page to get latest balance...")
             await page.reload()
