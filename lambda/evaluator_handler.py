@@ -149,22 +149,70 @@ class EvaluatorService:
         self.financial_bucket = os.environ.get('FINANCIAL_BUCKET', 'jrdb-main-financial-data')
 
     def get_inference_results(self, target_date: str) -> Optional[pd.DataFrame]:
-        """推論結果CSVをS3から取得"""
+        """推論結果CSVをS3から取得（Phase 131: residual_bets_*）"""
         year = target_date[:4]
         month = target_date[4:6]
         day = target_date[6:8]
-        key = f"inference-results/{year}/{month}/{day}/phase58_bets_{target_date}.csv"
+        key = f"inference-results/{year}/{month}/{day}/residual_bets_{target_date}.csv"
 
         try:
             response = self.s3.get_object(Bucket=self.financial_bucket, Key=key)
             df = pd.read_csv(response['Body'])
-            logger.info(f"推論結果取得: {len(df)}件")
+            logger.info(f"推論結果取得 (residual): {len(df)}件")
             return df
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
                 logger.warning(f"推論結果なし: {key}")
                 return None
             raise
+
+    def update_bankroll(self, target_date: str, summary: 'DailySummary') -> None:
+        """バンクロール状態をS3に更新（saudade推論用）"""
+        key = "bankroll/current.json"
+
+        # 既存のバンクロール読み込み
+        try:
+            response = self.s3.get_object(Bucket=self.financial_bucket, Key=key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            current_bankroll = float(data.get('bankroll', 200000))
+            history = data.get('history', [])
+            initial_bankroll = data.get('initial_bankroll', 200000)
+        except ClientError:
+            current_bankroll = 200000.0
+            history = []
+            initial_bankroll = 200000
+
+        # 当日の損益を反映
+        new_bankroll = current_bankroll + summary.profit
+
+        history.append({
+            'date': target_date,
+            'bankroll_before': current_bankroll,
+            'investment': summary.total_investment,
+            'payout': summary.total_payout,
+            'profit': summary.profit,
+            'bankroll_after': new_bankroll
+        })
+
+        # 直近30日分のみ保持
+        history = history[-30:]
+
+        state = {
+            'bankroll': new_bankroll,
+            'last_updated': target_date,
+            'initial_bankroll': initial_bankroll,
+            'history': history
+        }
+
+        self.s3.put_object(
+            Bucket=self.financial_bucket,
+            Key=key,
+            Body=json.dumps(state, ensure_ascii=False, indent=2),
+            ContentType='application/json'
+        )
+
+        logger.info(f"バンクロール更新: {current_bankroll:,.0f} → {new_bankroll:,.0f} "
+                     f"(profit: {summary.profit:+,})")
 
     def get_race_results(self, target_date: str) -> Optional[pd.DataFrame]:
         """レース結果（HJCファイル）をS3から取得"""
@@ -889,6 +937,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         result_key = service.save_evaluation_result(
             target_date, summary, details, cumulative, extended=extended
         )
+
+        # バンクロール更新（saudade推論用）
+        try:
+            service.update_bankroll(target_date, summary)
+        except Exception as e:
+            logger.warning(f"バンクロール更新失敗（評価は正常完了）: {e}")
 
         # Slack通知
         slack.send_daily_evaluation(
