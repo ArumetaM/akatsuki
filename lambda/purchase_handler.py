@@ -107,18 +107,23 @@ class S3Client:
         """
         推論結果CSVをS3からダウンロード
 
+        Phase 131: residual_bets_* を読み込む。
+        phase58は旧モデル（データリーク欠陥あり）のためフォールバック不可。
+
         Args:
             bucket: S3バケット名
             target_date: 対象日（YYYYMMDD）
 
         Returns:
-            推論結果のDataFrame（見つからない場合はNone）
+            推論結果のDataFrame
+
+        Raises:
+            FileNotFoundError: 推論結果が見つからない場合
         """
-        # S3パス: inference-results/YYYY/MM/DD/phase58_bets_YYYYMMDD.csv
         year = target_date[:4]
         month = target_date[4:6]
         day = target_date[6:8]
-        key = f"inference-results/{year}/{month}/{day}/phase58_bets_{target_date}.csv"
+        key = f"inference-results/{year}/{month}/{day}/residual_bets_{target_date}.csv"
 
         logger.info(f"Downloading inference results from s3://{bucket}/{key}")
 
@@ -134,9 +139,11 @@ class S3Client:
             return df
 
         except ClientError as e:
-            if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
-                logger.warning(f"Inference results not found: {key}")
-                return None
+            if e.response['Error']['Code'] in ('404', 'NoSuchKey'):
+                raise FileNotFoundError(
+                    f"推論結果が見つかりません: s3://{bucket}/{key}. "
+                    f"saudade Lambda が正常に実行されたか確認してください。"
+                )
             raise
 
     def get_bet_amount_schedule(self, bucket: str, target_date: str) -> int:
@@ -212,38 +219,63 @@ class S3Client:
         return key
 
 
-def convert_inference_to_tickets(df: pd.DataFrame, bet_amount: int) -> List[Dict[str, Any]]:
+def convert_inference_to_tickets(df: pd.DataFrame, default_bet_amount: int) -> List[Dict[str, Any]]:
     """
     推論結果をakatsuki形式のチケットに変換
+
+    Phase 131: CSVのbet_amountカラム（Kelly計算済み）を使用。
+    bet_amountがない場合はエラー（不完全な推論結果）。
 
     saudade出力:
     - PlaceName: 競馬場名（東京、中山等）
     - RaceNumber: レース番号
     - HorseNumber: 馬番
     - HorseName: 馬名
+    - bet_type: 'win' or 'place'
+    - bet_amount: Kelly計算済み金額（100円単位）
 
     akatsuki入力:
     - race_course: 競馬場
     - race_number: レース番号
-    - bet_type: 券種（固定: 単勝）
+    - bet_type: 券種（単勝/複勝）
     - horse_number: 馬番
     - horse_name: 馬名
     - amount: 金額
     """
+    if 'bet_amount' not in df.columns:
+        raise ValueError(
+            "推論結果にbet_amountカラムがありません。"
+            "saudade Lambda が Phase 131 Kelly ロジックで実行されているか確認してください。"
+        )
+
     tickets = []
 
     for _, row in df.iterrows():
+        amount = int(row['bet_amount'])
+        if amount <= 0:
+            continue
+
+        # bet_type変換: 'win' → '単勝', 'place' → '複勝'
+        bet_type_raw = row.get('bet_type', 'win')
+        if bet_type_raw == 'win':
+            bet_type = '単勝'
+        elif bet_type_raw == 'place':
+            bet_type = '複勝'
+        else:
+            bet_type = str(bet_type_raw)
+
         ticket = {
             'race_course': row['PlaceName'],
             'race_number': int(row['RaceNumber']),
-            'bet_type': '単勝',
+            'bet_type': bet_type,
             'horse_number': int(row['HorseNumber']),
             'horse_name': row.get('HorseName', ''),
-            'amount': bet_amount
+            'amount': amount
         }
         tickets.append(ticket)
 
-    logger.info(f"Converted {len(tickets)} tickets with amount {bet_amount}円 each")
+    total = sum(t['amount'] for t in tickets)
+    logger.info(f"Converted {len(tickets)} tickets, total: {total:,}円 (Kelly amounts)")
     return tickets
 
 
